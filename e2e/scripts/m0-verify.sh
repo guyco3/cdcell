@@ -15,7 +15,7 @@ docker run --rm --network "$NET" -v "$PWD/m0:/m0:ro" -v cdcell-e2e_pipcache:/roo
 ch() { curl -sf -u default:clickhouse "http://127.0.0.1:8123/?allow_database_iceberg=1" --data-binary "$1"; }
 ch "DROP DATABASE IF EXISTS lake"
 ch "CREATE DATABASE lake ENGINE = DataLakeCatalog('http://lakekeeper:8181/catalog') SETTINGS catalog_type = 'rest', warehouse = 'cdc', vended_credentials = true"
-scd1=$(ch "SELECT _cell_id || ' ' || _key_json || ' ' || argMax(after, (_epoch, _txid)).status FROM (SELECT * FROM lake.\`cdcell.shop.shop.orders\` LIMIT 1 BY ce_source, ce_id) GROUP BY _cell_id, _key_json HAVING argMax(op, (_epoch, _txid)) != 'd' ORDER BY 1")
+scd1=$(ch "SELECT _cell_id || ' ' || _key_json || ' ' || argMax(after, (_epoch, _txid)).status FROM (SELECT * FROM lake.\`m0test.shop.shop.orders\` LIMIT 1 BY ce_source, ce_id) GROUP BY _cell_id, _key_json HAVING argMax(op, (_epoch, _txid)) != 'd' ORDER BY 1")
 expected=$'Shop:aaaa [1] paid\nShop:bbbb [1] shipped'
 [ "$scd1" = "$expected" ] && echo "SCD1 via Lakekeeper: PASS" || { echo "SCD1 FAIL: $scd1"; exit 1; }
 

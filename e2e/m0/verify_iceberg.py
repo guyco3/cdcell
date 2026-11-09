@@ -23,7 +23,7 @@ from pyiceberg.types import (DoubleType, LongType, NestedField, StringType,
 
 URI = "http://lakekeeper:8181/catalog"
 cat = load_catalog("lk", type="rest", uri=URI, warehouse="cdc")
-NS = ("cdcell", "shop", "shop")
+NS = ("m0test", "shop", "shop")
 for i in range(1, len(NS) + 1):
     try:
         cat.create_namespace(NS[:i])
