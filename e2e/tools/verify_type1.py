@@ -74,9 +74,11 @@ def check_shop(name, dump):
     if got != want:
         bad = [k for k in set(got) | set(want) if got.get(k) != want.get(k)]
         problems.append(f"attachments differ at {bad[:5]}")
-    got = {r["k"] for r in type1("_cf_kv", cell, {"k": "after.k"}) if r["k"].startswith("pref:")}
-    if got != set(dump["kv"]):
-        problems.append(f"kv keys differ: {sorted(got ^ set(dump['kv']))[:5]}")
+    # KV table: keys and V8-decoded values (design §8.7)
+    got = {r["k"]: json.loads(r["v"]) for r in type1("_cdcell_kv", cell, {"k": "_key.k", "v": "after.value_json"}) if r["k"].startswith("pref:")}
+    if got != dump["kv"]:
+        bad = sorted(k for k in set(got) | set(dump["kv"]) if got.get(k) != dump["kv"].get(k))
+        problems.append(f"kv differs at {bad[:5]}")
     counts = f"orders={len(dump['orders'])} items={len(dump['items'])} attachments={len(dump['attachments'])} kv={len(dump['kv'])}"
     print(f"{'PASS' if not problems else 'FAIL'} {name} ({cell[:13]}…) {counts}")
     for p in problems:

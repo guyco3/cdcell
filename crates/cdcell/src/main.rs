@@ -2,6 +2,10 @@
 
 mod emit;
 mod iceberg_out;
+mod keys;
+mod pipeline;
+mod run;
+mod source;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -66,6 +70,10 @@ async fn main() -> Result<()> {
             let dir = PathBuf::from(args.get(2).context("fixture dir")?);
             selftest_fixture(dir, &flag("--catalog", "http://lakekeeper:8181/catalog"), &flag("--warehouse", "cdc"), &flag("--script", "shop")).await
         }
-        _ => bail!("usage: cdcell selftest-fixture DIR [--catalog URI] [--warehouse W] [--script S]"),
+        Some("run") => {
+            tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
+            run::run(run::Config::from_env()).await
+        }
+        _ => bail!("usage: cdcell run | cdcell selftest-fixture DIR [--catalog URI] [--warehouse W] [--script S]"),
     }
 }

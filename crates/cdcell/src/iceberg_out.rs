@@ -156,6 +156,44 @@ pub fn change_schema(info: &TableInfo) -> Result<Schema> {
     Schema::builder().with_fields(fields).build().context("change schema")
 }
 
+/// `_cdcell_kv` (design §8.7): the change-table envelope with
+/// `_key struct<k>` and value images `struct<value_type, value_json, value_raw>`.
+pub fn kv_schema() -> Result<Schema> {
+    let base = change_schema(&TableInfo {
+        name: "_cdcell_kv".into(),
+        root: 0,
+        sql: String::new(),
+        without_rowid: true,
+        columns: vec![cdcell_core::schema::Column {
+            name: "k".into(),
+            decl_type: "TEXT".into(),
+            affinity: Affinity::Text,
+            not_null: true,
+            default: cdcell_core::Value::Null,
+            generated: None,
+        }],
+        record_order: vec![0],
+        rowid_alias: None,
+        pk: vec![0],
+    })?;
+    // Replace before/after with the value image struct.
+    let mut ids = Ids(base.highest_field_id());
+    let mut fields: Vec<Arc<NestedField>> = Vec::new();
+    for f in base.as_struct().fields() {
+        if f.name == "before" || f.name == "after" {
+            let image = Type::Struct(StructType::new(vec![
+                opt(&mut ids, "value_type", prim(PrimitiveType::String)),
+                opt(&mut ids, "value_json", prim(PrimitiveType::String)),
+                opt(&mut ids, "value_raw", prim(PrimitiveType::Binary)),
+            ]));
+            fields.push(Arc::new(NestedField::optional(f.id, &f.name, image)));
+        } else {
+            fields.push(f.clone());
+        }
+    }
+    Schema::builder().with_fields(fields).build().context("kv schema")
+}
+
 /// `_cdcell_progress` (design §8.8).
 pub fn progress_schema() -> Result<Schema> {
     use PrimitiveType::*;
@@ -283,7 +321,9 @@ impl Sink {
                 parquet,
                 table.file_io().clone(),
                 DefaultLocationGenerator::new(table.metadata())?,
-                DefaultFileNameGenerator::new("cdcell".into(), None, iceberg::spec::DataFileFormat::Parquet),
+                // Unique per data file: a reused name would overwrite an
+                // existing file (Iceberg rejects it only as a duplicate add).
+                DefaultFileNameGenerator::new(unique_file_prefix(), None, iceberg::spec::DataFileFormat::Parquet),
             );
             let mut writer = DataFileWriterBuilder::new(rolling).build(pkey).await?;
             writer.write(batch).await?;
@@ -295,6 +335,12 @@ impl Sink {
         tx.commit(self.catalog.as_ref()).await?;
         Ok(())
     }
+}
+
+fn unique_file_prefix() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
+    format!("cdcell-{now}-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 fn to_batch(schema: &Arc<arrow_schema::Schema>, rows: &[&OutRow]) -> Result<RecordBatch> {

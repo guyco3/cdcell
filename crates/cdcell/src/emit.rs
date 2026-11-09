@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use cdcell_core::schema::{Affinity, TableInfo};
 use cdcell_core::value::key_json;
-use cdcell_core::{Op, RowChange, Value};
+use cdcell_core::{RowChange, Value};
 
 use crate::iceberg_out::{OutRow, OutValue};
 
@@ -109,89 +109,146 @@ fn key_struct(info: &TableInfo, key: &[Value]) -> OutValue {
     OutValue::Struct(m)
 }
 
-/// Builds the output rows for one unit. `changes` must be the unit's row
-/// changes for one table set, sorted by (table, pk_json) (the decoder's
-/// order), which fixes `transaction.total_order`.
+/// The CloudEvents / Debezium fields every row carries (design §8.2).
+#[allow(clippy::too_many_arguments)]
+fn base(ctx: &Ctx<'_>, table: &str, pk: &str, op: &str, snapshot: &str, total: i64, dco: i64) -> OutRow {
+    let s = |v: &str| OutValue::Str(v.to_string());
+    let mut r: OutRow = BTreeMap::new();
+    r.insert("ce_id".into(), s(&ce_id(ctx.kind, ctx.epoch, ctx.txid, table, pk)));
+    r.insert("ce_source".into(), s(&ce_source(ctx.script, ctx.class, ctx.cell)));
+    r.insert("ce_specversion".into(), s("1.0"));
+    r.insert("ce_type".into(), s(&format!("{}.cdcell.sqlite.DataChangeEvent", ctx.ce_type_prefix)));
+    r.insert("ce_subject".into(), s(&format!("{}/{}", table, utf8_percent_encode(pk, SUBJECT))));
+    r.insert("ce_time".into(), OutValue::Ts(ctx.capture_ms * 1000));
+    r.insert("ce_datacontenttype".into(), s("application/json"));
+    r.insert("ce_dataschema".into(), s(&format!("urn:cdcell:schema:{}:{}:{}:{}", ctx.script, ctx.class, table, ctx.schema_version)));
+    r.insert("ce_sequence".into(), s(&format!("{:020}{:020}{:010}", ctx.epoch, ctx.txid, total)));
+    r.insert("ce_partitionkey".into(), s(&format!("{}/{}/{}", ctx.script, ctx.class, ctx.cell)));
+    r.insert("ce_recordedtime".into(), OutValue::Ts(ctx.now_us));
+    r.insert("_cell_id".into(), s(ctx.cell));
+    r.insert("_epoch".into(), OutValue::Long(ctx.epoch as i64));
+    r.insert("_txid".into(), OutValue::Long(ctx.txid as i64));
+    r.insert("_key_json".into(), s(pk));
+    r.insert("op".into(), s(op));
+    let mut src = BTreeMap::new();
+    src.insert("version".into(), s(CONNECTOR_VERSION));
+    src.insert("connector".into(), s("cdcell"));
+    src.insert("name".into(), s(ctx.script));
+    src.insert("ts_ms".into(), OutValue::Long(ctx.capture_ms));
+    src.insert("ts_us".into(), OutValue::Long(ctx.capture_ms * 1000));
+    src.insert("snapshot".into(), s(snapshot));
+    src.insert("db".into(), s(ctx.cell));
+    src.insert("sequence".into(), s(&format!("[\"{}:{}\"]", ctx.epoch, ctx.txid)));
+    src.insert("table".into(), s(table));
+    src.insert("change_id".into(), OutValue::Long(ctx.txid as i64));
+    src.insert("script".into(), s(ctx.script));
+    src.insert("cell_class".into(), s(ctx.class));
+    src.insert("cell_id".into(), s(ctx.cell));
+    src.insert("epoch".into(), OutValue::Long(ctx.epoch as i64));
+    src.insert("txid".into(), OutValue::Long(ctx.txid as i64));
+    src.insert("synthetic".into(), OutValue::Bool(matches!(ctx.kind, Kind::Synthetic)));
+    r.insert("source".into(), OutValue::Struct(src));
+    let mut tx = BTreeMap::new();
+    tx.insert("id".into(), s(&format!("{}:{}", ctx.epoch, ctx.txid)));
+    tx.insert("total_order".into(), OutValue::Long(total));
+    tx.insert("data_collection_order".into(), OutValue::Long(dco));
+    r.insert("transaction".into(), OutValue::Struct(tx));
+    r.insert("ts_ms".into(), OutValue::Long(ctx.now_us / 1000));
+    r.insert("ts_us".into(), OutValue::Long(ctx.now_us));
+    r
+}
+
+fn op_and_snapshot(ctx: &Ctx<'_>, c: &RowChange, i: usize, n: usize) -> (&'static str, &'static str) {
+    match ctx.kind {
+        Kind::Bootstrap { first, last } => ("r", if first && i == 0 { "first" } else if last && i + 1 == n { "last" } else { "true" }),
+        _ => (c.op.code(), "false"),
+    }
+}
+
+/// Builds the output rows for one unit. `changes` are the unit's row changes
+/// in the decoder's (table, pk_json) order, which fixes
+/// `transaction.total_order`.
 pub fn rows(ctx: &Ctx<'_>, infos: &dyn Fn(&str) -> Option<TableInfo>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
     let mut out = Vec::with_capacity(changes.len());
     let mut per_table: BTreeMap<&str, i64> = BTreeMap::new();
-    let source = ce_source(ctx.script, ctx.class, ctx.cell);
-    let partition = format!("{}/{}/{}", ctx.script, ctx.class, ctx.cell);
     let n = changes.len();
     for (i, c) in changes.iter().enumerate() {
         let Some(info) = infos(&c.table) else { continue };
-        let total = i as i64 + 1;
         let dco = {
             let e = per_table.entry(c.table.as_str()).or_default();
             *e += 1;
             *e
         };
         let pk = key_json(&c.key);
+        let (op, snapshot) = op_and_snapshot(ctx, c, i, n);
+        let mut r = base(ctx, &c.table, &pk, op, snapshot, i as i64 + 1, dco);
         let mut raw = Vec::new();
-        let before = c.before.as_ref().map(|r| image(&info, r, &mut raw, c.after.is_none()));
-        let after = c.after.as_ref().map(|r| image(&info, r, &mut raw, true));
-        let (op, snapshot) = match ctx.kind {
-            Kind::Bootstrap { first, last } => ("r", if first { "first" } else if last && i + 1 == n { "last" } else { "true" }),
-            _ => (c.op.code(), "false"),
-        };
-        let kind = ctx.kind;
-        let mut r: OutRow = BTreeMap::new();
-        let s = |v: &str| OutValue::Str(v.to_string());
-        r.insert("ce_id".into(), s(&ce_id(kind, ctx.epoch, ctx.txid, &c.table, &pk)));
-        r.insert("ce_source".into(), s(&source));
-        r.insert("ce_specversion".into(), s("1.0"));
-        r.insert("ce_type".into(), s(&format!("{}.cdcell.sqlite.DataChangeEvent", ctx.ce_type_prefix)));
-        r.insert("ce_subject".into(), s(&format!("{}/{}", c.table, utf8_percent_encode(&pk, SUBJECT))));
-        r.insert("ce_time".into(), OutValue::Ts(ctx.capture_ms * 1000));
-        r.insert("ce_datacontenttype".into(), s("application/json"));
-        r.insert("ce_dataschema".into(), s(&format!("urn:cdcell:schema:{}:{}:{}:{}", ctx.script, ctx.class, c.table, ctx.schema_version)));
-        r.insert("ce_sequence".into(), s(&format!("{:020}{:020}{:010}", ctx.epoch, ctx.txid, total)));
-        r.insert("ce_partitionkey".into(), s(&partition));
-        r.insert("ce_recordedtime".into(), OutValue::Ts(ctx.now_us));
-        r.insert("_cell_id".into(), s(ctx.cell));
-        r.insert("_epoch".into(), OutValue::Long(ctx.epoch as i64));
-        r.insert("_txid".into(), OutValue::Long(ctx.txid as i64));
-        r.insert("_key_json".into(), s(&pk));
-        r.insert("_key".into(), key_struct(&info, &c.key));
-        r.insert("op".into(), s(op));
-        if let Some(b) = before {
-            r.insert("before".into(), b);
+        if let Some(b) = c.before.as_ref() {
+            r.insert("before".into(), image(&info, b, &mut raw, c.after.is_none()));
         }
-        if let Some(a) = after {
-            r.insert("after".into(), a);
+        if let Some(a) = c.after.as_ref() {
+            r.insert("after".into(), image(&info, a, &mut raw, true));
         }
         if !raw.is_empty() {
             r.insert("_raw".into(), OutValue::Map(raw));
         }
-        let mut src = BTreeMap::new();
-        src.insert("version".into(), s(CONNECTOR_VERSION));
-        src.insert("connector".into(), s("cdcell"));
-        src.insert("name".into(), s(ctx.script));
-        src.insert("ts_ms".into(), OutValue::Long(ctx.capture_ms));
-        src.insert("ts_us".into(), OutValue::Long(ctx.capture_ms * 1000));
-        src.insert("snapshot".into(), s(snapshot));
-        src.insert("db".into(), s(ctx.cell));
-        src.insert("sequence".into(), s(&format!("[\"{}:{}\"]", ctx.epoch, ctx.txid)));
-        src.insert("table".into(), s(&c.table));
-        src.insert("change_id".into(), OutValue::Long(ctx.txid as i64));
-        src.insert("script".into(), s(ctx.script));
-        src.insert("cell_class".into(), s(ctx.class));
-        src.insert("cell_id".into(), s(ctx.cell));
-        src.insert("epoch".into(), OutValue::Long(ctx.epoch as i64));
-        src.insert("txid".into(), OutValue::Long(ctx.txid as i64));
-        src.insert("synthetic".into(), OutValue::Bool(matches!(kind, Kind::Synthetic)));
-        r.insert("source".into(), OutValue::Struct(src));
-        let mut tx = BTreeMap::new();
-        tx.insert("id".into(), s(&format!("{}:{}", ctx.epoch, ctx.txid)));
-        tx.insert("total_order".into(), OutValue::Long(total));
-        tx.insert("data_collection_order".into(), OutValue::Long(dco));
-        r.insert("transaction".into(), OutValue::Struct(tx));
-        r.insert("ts_ms".into(), OutValue::Long(ctx.now_us / 1000));
-        r.insert("ts_us".into(), OutValue::Long(ctx.now_us));
-        let _ = Op::Insert;
+        r.insert("_key".into(), key_struct(&info, &c.key));
         out.push((c.table.clone(), r));
     }
     out
+}
+
+/// The KV table (design §8.7).
+pub const KV_TABLE: &str = "_cdcell_kv";
+
+fn kv_image(row: &[(String, Value)]) -> OutValue {
+    let v = row.iter().find(|(n, _)| n == "v").map(|(_, v)| v.clone()).unwrap_or(Value::Null);
+    let d = cdcell_core::kv::decode(&v);
+    let mut m = BTreeMap::new();
+    m.insert("value_type".into(), OutValue::Str(d.value_type.as_str().into()));
+    m.insert("value_json".into(), d.value_json.map_or(OutValue::Null, OutValue::Str));
+    m.insert("value_raw".into(), OutValue::Bin(d.value_raw));
+    OutValue::Struct(m)
+}
+
+/// `_cf_KV` changes → `_cdcell_kv` rows, keyed by `k` (one scope per DB).
+pub fn kv_rows(ctx: &Ctx<'_>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
+    let n = changes.len();
+    let mut out = Vec::with_capacity(n);
+    for (i, c) in changes.iter().enumerate() {
+        let k = match c.key.last() {
+            Some(Value::Text(k)) => k.clone(),
+            _ => continue,
+        };
+        let pk = key_json(&[Value::Text(k.clone())]);
+        let (op, snapshot) = op_and_snapshot(ctx, c, i, n);
+        let mut r = base(ctx, KV_TABLE, &pk, op, snapshot, i as i64 + 1, i as i64 + 1);
+        let mut key = BTreeMap::new();
+        key.insert("k".to_string(), OutValue::Str(k));
+        r.insert("_key".into(), OutValue::Struct(key));
+        if let Some(b) = c.before.as_ref() {
+            r.insert("before".into(), kv_image(b));
+        }
+        if let Some(a) = c.after.as_ref() {
+            r.insert("after".into(), kv_image(a));
+        }
+        out.push((KV_TABLE.to_string(), r));
+    }
+    out
+}
+
+/// Placeholder table info for the KV table's batch entry.
+pub fn kv_info() -> TableInfo {
+    TableInfo {
+        name: KV_TABLE.into(),
+        root: 0,
+        sql: String::new(),
+        without_rowid: false,
+        columns: Vec::new(),
+        record_order: Vec::new(),
+        rowid_alias: None,
+        pk: Vec::new(),
+    }
 }
 
 #[cfg(test)]
