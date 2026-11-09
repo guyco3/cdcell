@@ -1,0 +1,19 @@
+{
+	auto_https off
+	admin off
+}
+
+# Random node per request, like a cloud load balancer in front of the fleet.
+# A request for a cell the chosen node does not own is forwarded by celld
+# itself over peer HTTP, so this exercises routing as well.
+:8080 {
+	reverse_proxy celld-a:8080 celld-b:8080 celld-c:8080 {
+		lb_policy random
+		lb_try_duration 20s
+		fail_duration 10s
+		transport http {
+			dial_timeout 2s
+			response_header_timeout 30s
+		}
+	}
+}

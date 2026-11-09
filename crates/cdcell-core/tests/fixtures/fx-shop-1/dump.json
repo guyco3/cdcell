@@ -1,0 +1,647 @@
+{
+ "cell": "Shop:86b03bee26d5e539a33f50f830601a16f93c8684eedf01010f3f2b7ecf2de4ca",
+ "name": "fx-shop-1",
+ "ops": {
+  "create": 38,
+  "update": 41,
+  "attach": 16,
+  "bulk": 15,
+  "kv": 13,
+  "delete": 7,
+  "retouch": 20
+ },
+ "dump": {
+  "orders": [
+   {
+    "id": 2,
+    "customer": "dee",
+    "status": "delivered",
+    "total": 866.93,
+    "updated_at": 1794203356680
+   },
+   {
+    "id": 3,
+    "customer": "cy",
+    "status": "shipped",
+    "total": 97.14,
+    "updated_at": 1794203356511
+   },
+   {
+    "id": 5,
+    "customer": "fay",
+    "status": "refunded",
+    "total": 36.54,
+    "updated_at": 1794203356280
+   },
+   {
+    "id": 7,
+    "customer": "eli",
+    "status": "packed",
+    "total": 496.23,
+    "updated_at": 1794203356260
+   },
+   {
+    "id": 9,
+    "customer": "dee",
+    "status": "delivered",
+    "total": 11.99,
+    "updated_at": 1794203356728
+   },
+   {
+    "id": 10,
+    "customer": "eli",
+    "status": "paid",
+    "total": 1291.07,
+    "updated_at": 1794203356741
+   },
+   {
+    "id": 11,
+    "customer": "bo",
+    "status": "shipped",
+    "total": 141.04,
+    "updated_at": 1794203356323
+   },
+   {
+    "id": 12,
+    "customer": "fay",
+    "status": "delivered",
+    "total": 489.9,
+    "updated_at": 1794203356757
+   },
+   {
+    "id": 13,
+    "customer": "ada",
+    "status": "refunded",
+    "total": 165.76,
+    "updated_at": 1794203356693
+   },
+   {
+    "id": 14,
+    "customer": "bo",
+    "status": "packed",
+    "total": 460.42,
+    "updated_at": 1794203356684
+   },
+   {
+    "id": 15,
+    "customer": "eli",
+    "status": "new",
+    "total": 191.02,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 16,
+    "customer": "gus",
+    "status": "refunded",
+    "total": 79,
+    "updated_at": 1794203356535
+   },
+   {
+    "id": 17,
+    "customer": "dee",
+    "status": "new",
+    "total": 244.46,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 18,
+    "customer": "dee",
+    "status": "paid",
+    "total": 238.65,
+    "updated_at": 1794203356626
+   },
+   {
+    "id": 19,
+    "customer": "gus",
+    "status": "new",
+    "total": 436.89,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 20,
+    "customer": "ada",
+    "status": "refunded",
+    "total": 91.8,
+    "updated_at": 1794203356582
+   },
+   {
+    "id": 21,
+    "customer": "cy",
+    "status": "new",
+    "total": 334.41,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 22,
+    "customer": "bo",
+    "status": "new",
+    "total": 332.15,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 23,
+    "customer": "gus",
+    "status": "new",
+    "total": 228.26,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 24,
+    "customer": "fay",
+    "status": "shipped",
+    "total": 8.47,
+    "updated_at": 1794203356791
+   },
+   {
+    "id": 25,
+    "customer": "fay",
+    "status": "new",
+    "total": 61.26,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 26,
+    "customer": "cy",
+    "status": "new",
+    "total": 359.59,
+    "updated_at": 1794203356761
+   },
+   {
+    "id": 27,
+    "customer": "eli",
+    "status": "paid",
+    "total": 44.12,
+    "updated_at": 1794203356753
+   },
+   {
+    "id": 29,
+    "customer": "gus",
+    "status": "new",
+    "total": 237.34,
+    "updated_at": 1794203356765
+   },
+   {
+    "id": 30,
+    "customer": "eli",
+    "status": "new",
+    "total": 130.94,
+    "updated_at": 1794203356769
+   },
+   {
+    "id": 31,
+    "customer": "eli",
+    "status": "new",
+    "total": 224.82,
+    "updated_at": 1794203356779
+   },
+   {
+    "id": 32,
+    "customer": "eli",
+    "status": "new",
+    "total": 126.91,
+    "updated_at": 1794203356783
+   },
+   {
+    "id": 33,
+    "customer": "eli",
+    "status": "new",
+    "total": 442.32,
+    "updated_at": 1794203356817
+   },
+   {
+    "id": 34,
+    "customer": "gus",
+    "status": "new",
+    "total": 51.98,
+    "updated_at": 1794203356822
+   },
+   {
+    "id": 35,
+    "customer": "fay",
+    "status": "new",
+    "total": 268.34,
+    "updated_at": 1794203356834
+   },
+   {
+    "id": 36,
+    "customer": "gus",
+    "status": "new",
+    "total": 295.45,
+    "updated_at": 1794203356844
+   }
+  ],
+  "items": [
+   {
+    "order_id": 2,
+    "sku": "apple",
+    "qty": 3
+   },
+   {
+    "order_id": 2,
+    "sku": "cheese",
+    "qty": 1
+   },
+   {
+    "order_id": 3,
+    "sku": "dates",
+    "qty": 5
+   },
+   {
+    "order_id": 3,
+    "sku": "figs",
+    "qty": 3
+   },
+   {
+    "order_id": 5,
+    "sku": "bread",
+    "qty": 5
+   },
+   {
+    "order_id": 5,
+    "sku": "dates",
+    "qty": 4
+   },
+   {
+    "order_id": 7,
+    "sku": "apple",
+    "qty": 4
+   },
+   {
+    "order_id": 7,
+    "sku": "eggs",
+    "qty": 4
+   },
+   {
+    "order_id": 7,
+    "sku": "figs",
+    "qty": 3
+   },
+   {
+    "order_id": 9,
+    "sku": "cheese",
+    "qty": 2
+   },
+   {
+    "order_id": 9,
+    "sku": "eggs",
+    "qty": 3
+   },
+   {
+    "order_id": 10,
+    "sku": "dates",
+    "qty": 5
+   },
+   {
+    "order_id": 10,
+    "sku": "eggs",
+    "qty": 4
+   },
+   {
+    "order_id": 11,
+    "sku": "apple",
+    "qty": 1
+   },
+   {
+    "order_id": 12,
+    "sku": "apple",
+    "qty": 3
+   },
+   {
+    "order_id": 12,
+    "sku": "dates",
+    "qty": 5
+   },
+   {
+    "order_id": 13,
+    "sku": "bread",
+    "qty": 1
+   },
+   {
+    "order_id": 13,
+    "sku": "dates",
+    "qty": 1
+   },
+   {
+    "order_id": 13,
+    "sku": "figs",
+    "qty": 3
+   },
+   {
+    "order_id": 14,
+    "sku": "apple",
+    "qty": 4
+   },
+   {
+    "order_id": 14,
+    "sku": "bread",
+    "qty": 2
+   },
+   {
+    "order_id": 14,
+    "sku": "dates",
+    "qty": 4
+   },
+   {
+    "order_id": 15,
+    "sku": "dates",
+    "qty": 2
+   },
+   {
+    "order_id": 15,
+    "sku": "figs",
+    "qty": 1
+   },
+   {
+    "order_id": 16,
+    "sku": "apple",
+    "qty": 4
+   },
+   {
+    "order_id": 17,
+    "sku": "apple",
+    "qty": 1
+   },
+   {
+    "order_id": 17,
+    "sku": "cheese",
+    "qty": 1
+   },
+   {
+    "order_id": 18,
+    "sku": "apple",
+    "qty": 5
+   },
+   {
+    "order_id": 19,
+    "sku": "apple",
+    "qty": 4
+   },
+   {
+    "order_id": 19,
+    "sku": "figs",
+    "qty": 2
+   },
+   {
+    "order_id": 20,
+    "sku": "apple",
+    "qty": 3
+   },
+   {
+    "order_id": 20,
+    "sku": "figs",
+    "qty": 2
+   },
+   {
+    "order_id": 21,
+    "sku": "cheese",
+    "qty": 3
+   },
+   {
+    "order_id": 21,
+    "sku": "dates",
+    "qty": 4
+   },
+   {
+    "order_id": 21,
+    "sku": "eggs",
+    "qty": 4
+   },
+   {
+    "order_id": 22,
+    "sku": "bread",
+    "qty": 3
+   },
+   {
+    "order_id": 22,
+    "sku": "dates",
+    "qty": 4
+   },
+   {
+    "order_id": 22,
+    "sku": "eggs",
+    "qty": 3
+   },
+   {
+    "order_id": 23,
+    "sku": "apple",
+    "qty": 1
+   },
+   {
+    "order_id": 24,
+    "sku": "cheese",
+    "qty": 1
+   },
+   {
+    "order_id": 25,
+    "sku": "apple",
+    "qty": 1
+   },
+   {
+    "order_id": 25,
+    "sku": "dates",
+    "qty": 5
+   },
+   {
+    "order_id": 26,
+    "sku": "eggs",
+    "qty": 5
+   },
+   {
+    "order_id": 27,
+    "sku": "apple",
+    "qty": 3
+   },
+   {
+    "order_id": 27,
+    "sku": "figs",
+    "qty": 4
+   },
+   {
+    "order_id": 29,
+    "sku": "bread",
+    "qty": 2
+   },
+   {
+    "order_id": 29,
+    "sku": "dates",
+    "qty": 1
+   },
+   {
+    "order_id": 29,
+    "sku": "eggs",
+    "qty": 4
+   },
+   {
+    "order_id": 30,
+    "sku": "apple",
+    "qty": 2
+   },
+   {
+    "order_id": 30,
+    "sku": "bread",
+    "qty": 1
+   },
+   {
+    "order_id": 31,
+    "sku": "bread",
+    "qty": 1
+   },
+   {
+    "order_id": 31,
+    "sku": "cheese",
+    "qty": 5
+   },
+   {
+    "order_id": 32,
+    "sku": "bread",
+    "qty": 5
+   },
+   {
+    "order_id": 32,
+    "sku": "cheese",
+    "qty": 4
+   },
+   {
+    "order_id": 32,
+    "sku": "dates",
+    "qty": 4
+   },
+   {
+    "order_id": 33,
+    "sku": "apple",
+    "qty": 5
+   },
+   {
+    "order_id": 33,
+    "sku": "bread",
+    "qty": 1
+   },
+   {
+    "order_id": 33,
+    "sku": "cheese",
+    "qty": 3
+   },
+   {
+    "order_id": 34,
+    "sku": "dates",
+    "qty": 1
+   },
+   {
+    "order_id": 35,
+    "sku": "bread",
+    "qty": 4
+   },
+   {
+    "order_id": 36,
+    "sku": "bread",
+    "qty": 4
+   },
+   {
+    "order_id": 36,
+    "sku": "dates",
+    "qty": 3
+   },
+   {
+    "order_id": 36,
+    "sku": "eggs",
+    "qty": 5
+   }
+  ],
+  "attachments": [
+   {
+    "id": 3,
+    "order_id": 2,
+    "bytes": 7402,
+    "tail": "8AE88409"
+   },
+   {
+    "id": 4,
+    "order_id": 3,
+    "bytes": 7047,
+    "tail": "5218B8DB"
+   },
+   {
+    "id": 5,
+    "order_id": 3,
+    "bytes": 9716,
+    "tail": "4D634BFE"
+   },
+   {
+    "id": 6,
+    "order_id": 12,
+    "bytes": 6591,
+    "tail": "FBF300D3"
+   },
+   {
+    "id": 7,
+    "order_id": 2,
+    "bytes": 18504,
+    "tail": "C49123CD"
+   },
+   {
+    "id": 8,
+    "order_id": 3,
+    "bytes": 17547,
+    "tail": "55A1EB1F"
+   },
+   {
+    "id": 9,
+    "order_id": 7,
+    "bytes": 10501,
+    "tail": "03E093CC"
+   },
+   {
+    "id": 10,
+    "order_id": 18,
+    "bytes": 8346,
+    "tail": "1C2EA9C1"
+   },
+   {
+    "id": 11,
+    "order_id": 17,
+    "bytes": 11663,
+    "tail": "A1D1795C"
+   },
+   {
+    "id": 12,
+    "order_id": 16,
+    "bytes": 15487,
+    "tail": "8FD34242"
+   },
+   {
+    "id": 13,
+    "order_id": 12,
+    "bytes": 9981,
+    "tail": "84EAC6DB"
+   },
+   {
+    "id": 15,
+    "order_id": 12,
+    "bytes": 18667,
+    "tail": "3E238359"
+   }
+  ],
+  "kv": {
+   "pref:ada": {
+    "theme": "dark",
+    "at": 1794203356562
+   },
+   "pref:bo": {
+    "theme": "dark",
+    "at": 1794203356496
+   },
+   "pref:dee": {
+    "theme": "light",
+    "at": 1794203356502
+   },
+   "pref:eli": {
+    "theme": "light",
+    "at": 1794203356812
+   },
+   "pref:fay": {
+    "theme": "dark",
+    "at": 1794203356787
+   }
+  }
+ }
+}
