@@ -219,7 +219,11 @@ impl Pipeline {
                     }
                 };
                 if b.verdict == Verdict::Suspect {
+                    // Parked in memory; its message is settled with the next
+                    // commit so broker redelivery never decides history
+                    // (design §5.3; durable parking: M5).
                     self.stats.suspects += 1;
+                    self.batch_msgs.extend(b.u.msg.take());
                 }
             }
             // 2. apply what is next and confirmed
@@ -239,6 +243,14 @@ impl Pipeline {
                 .buffer
                 .iter()
                 .filter(|(&(e, min, _), b)| st.epoch.is_none_or(|cur| e > cur) && min == 1 && b.verdict == Verdict::Confirmed)
+                .map(|(k, _)| *k)
+                .next();
+            // A paged-epoch marker `(c+1)-(c+1)` of a higher epoch gives the
+            // exact cut c (design §5.4 rule 2, §5.5).
+            let marker = st
+                .buffer
+                .iter()
+                .filter(|(&(e, _, _), b)| st.epoch.is_some_and(|cur| e > cur) && b.verdict == Verdict::Confirmed && b.u.unit.is_paged_marker())
                 .map(|(k, _)| *k)
                 .next();
             let next = st.epoch.and_then(|cur| {
@@ -268,6 +280,11 @@ impl Pipeline {
                     let kind = if suspects && st.epoch.is_some() { Kind::Synthetic } else { Kind::Streamed };
                     self.apply(cell, b.u, kind).await?;
                 }
+                (_, None) if marker.is_some() => {
+                    if !self.paged_cut(cell, marker.unwrap()).await? {
+                        return Ok(());
+                    }
+                }
                 _ => {
                     // Blocked: a gap, a suspect tail, or a cell seen mid-epoch.
                     let st = self.cells.get_mut(cell).unwrap();
@@ -285,6 +302,57 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// Rule 2: resolve the current epoch against a paged marker. Returns
+    /// false when it cannot proceed yet (missing units, unproven lineage).
+    async fn paged_cut(&mut self, cell: &str, marker: (u64, u64, u64)) -> Result<bool> {
+        let (new_epoch, m, _) = marker;
+        let cut = m - 1;
+        let cur = self.cells[cell].epoch.unwrap();
+        // The cut must belong to the current epoch: every epoch in between
+        // must be empty (the predecessor proof, design §5.5).
+        for e in (cur + 1)..new_epoch {
+            if !self.src.list(&format!("cells/{cell}/ltx/e{e}/")).await?.is_empty() {
+                warn!(cell, cur, new_epoch, intermediate = e, "paged cut belongs to an intermediate epoch; resync needed");
+                return Ok(false);
+            }
+        }
+        let confirmed = self.cells[cell].confirmed_txid;
+        if cut < confirmed {
+            warn!(cell, cut, confirmed, "paged cut below the confirmed point; resync needed");
+            return Ok(false);
+        }
+        // Apply the current epoch's units up to the cut (history whatever
+        // their verdict), then drop everything above it (phantoms).
+        while self.cells[cell].confirmed_txid < cut {
+            let c = self.cells[cell].confirmed_txid;
+            let k = self.cells[cell].buffer.keys().find(|&&(e, min, max)| e == cur && min <= c + 1 && max > c && max <= cut).copied();
+            match k {
+                Some(k) => {
+                    let b = self.cells.get_mut(cell).unwrap().buffer.remove(&k).unwrap();
+                    self.apply(cell, b.u, Kind::Streamed).await?;
+                }
+                None => {
+                    self.fill_gap(cell).await?;
+                    return Ok(false);
+                }
+            }
+        }
+        let st = self.cells.get_mut(cell).unwrap();
+        let doomed: Vec<_> = st.buffer.keys().filter(|&&(e, _, max)| e < new_epoch && (e != cur || max > cut)).copied().collect();
+        for d in doomed {
+            let b = st.buffer.remove(&d).unwrap();
+            self.stats.dropped += 1;
+            self.batch_msgs.extend(b.u.msg);
+        }
+        let st = self.cells.get_mut(cell).unwrap();
+        let b = st.buffer.remove(&marker).unwrap();
+        st.epoch = Some(new_epoch);
+        st.confirmed_txid = b.u.unit.max_txid;
+        self.batch_msgs.extend(b.u.msg);
+        info!(cell, cur, new_epoch, cut, "paged epoch: resolved by marker cut");
+        Ok(true)
     }
 
     /// Gap repair (design §7 source 1): LIST the epoch's L0 prefix and fetch

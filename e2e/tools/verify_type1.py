@@ -20,6 +20,7 @@ import urllib.request
 CH = "http://127.0.0.1:8123/"
 LB = "http://127.0.0.1:8180"
 NS = "cdcell.shop.shop"
+ALLOW_DUPS = False
 
 
 def id_from_name(script, cls, name):
@@ -79,6 +80,11 @@ def check_shop(name, dump):
     if got != dump["kv"]:
         bad = sorted(k for k in set(got) | set(dump["kv"]) if got.get(k) != dump["kv"].get(k))
         problems.append(f"kv differs at {bad[:5]}")
+    # No duplicate events in normal operation (M3 gate): (ce_source, ce_id) unique.
+    for t in ("orders", "items", "attachments", "_cdcell_kv"):
+        d = ch(f"SELECT count() - uniqExact(ce_source, ce_id) AS d FROM lake.`{NS}.{t}` WHERE _cell_id = '{cell}'")[0]["d"]
+        if int(d) and not ALLOW_DUPS:
+            problems.append(f"{t}: {d} duplicate events")
     counts = f"orders={len(dump['orders'])} items={len(dump['items'])} attachments={len(dump['attachments'])} kv={len(dump['kv'])}"
     print(f"{'PASS' if not problems else 'FAIL'} {name} ({cell[:13]}…) {counts}")
     for p in problems:
@@ -90,7 +96,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shops", nargs="*", default=[])
     ap.add_argument("--fixture")
+    ap.add_argument("--allow-dups", action="store_true", help="after crashes, duplicates are allowed (deduped by id)")
     a = ap.parse_args()
+    global ALLOW_DUPS
+    ALLOW_DUPS = a.allow_dups
     ensure_db()
     ok = True
     if a.fixture:
