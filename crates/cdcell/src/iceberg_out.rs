@@ -223,6 +223,16 @@ pub fn ident(name: &str) -> String {
 
 pub struct Sink {
     catalog: Arc<dyn Catalog>,
+    uri: String,
+    warehouse: String,
+    http: reqwest::Client,
+}
+
+/// One table's staged change, ready for an atomic multi-table commit.
+pub struct Staged {
+    pub ident: TableIdent,
+    pub requirements: Vec<iceberg::TableRequirement>,
+    pub updates: Vec<iceberg::TableUpdate>,
 }
 
 impl Sink {
@@ -235,7 +245,7 @@ impl Sink {
             .load("lakekeeper", HashMap::from([("uri".to_string(), uri.to_string()), ("warehouse".to_string(), warehouse.to_string())]))
             .await
             .context("connect to the REST catalog")?;
-        Ok(Sink { catalog: Arc::new(catalog) })
+        Ok(Sink { catalog: Arc::new(catalog), uri: uri.trim_end_matches('/').to_string(), warehouse: warehouse.to_string(), http: reqwest::Client::new() })
     }
 
     pub async fn ensure_namespace(&self, levels: &[String]) -> Result<()> {
@@ -280,10 +290,19 @@ impl Sink {
     }
 
     /// Appends rows in one snapshot carrying `snapshot_props` (e.g.
-    /// `cdcell.batch`). Rows are grouped by partition.
+    /// `cdcell.batch`), committed on its own.
     pub async fn append(&self, ident: &TableIdent, rows: &[OutRow], snapshot_props: HashMap<String, String>) -> Result<()> {
+        if let Some(staged) = self.stage(ident, rows, snapshot_props).await? {
+            self.commit_atomic(vec![staged]).await?;
+        }
+        Ok(())
+    }
+
+    /// Writes the rows' data files (grouped by partition) and captures the
+    /// table's append (requirements + updates) without committing it.
+    pub async fn stage(&self, ident: &TableIdent, rows: &[OutRow], snapshot_props: HashMap<String, String>) -> Result<Option<Staged>> {
         if rows.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let table = self.catalog.load_table(ident).await?;
         let schema = table.metadata().current_schema().clone();
@@ -332,8 +351,56 @@ impl Sink {
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(data_files).set_snapshot_properties(snapshot_props);
         let tx = action.apply(tx)?;
-        tx.commit(self.catalog.as_ref()).await?;
+        let capture = crate::capture::Capturing::new(self.catalog.clone());
+        match tx.commit(&capture).await {
+            Err(e) if e.message() == crate::capture::CAPTURED => {}
+            Err(e) => return Err(e.into()),
+            Ok(_) => return Err(anyhow!("commit was not captured")),
+        }
+        let mut commit = capture.captured.lock().unwrap().pop().ok_or_else(|| anyhow!("no captured commit"))?;
+        Ok(Some(Staged { ident: commit.identifier().clone(), requirements: commit.take_requirements(), updates: commit.take_updates() }))
+    }
+
+    /// One atomic multi-table commit (`POST /v1/{prefix}/transactions/commit`):
+    /// all tables advance or none does.
+    pub async fn commit_atomic(&self, staged: Vec<Staged>) -> Result<()> {
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let cfg: serde_json::Value = self.http.get(format!("{}/v1/config", self.uri)).query(&[("warehouse", &self.warehouse)]).send().await?.error_for_status()?.json().await?;
+        let prefix = cfg["defaults"]["prefix"].as_str().or(cfg["overrides"]["prefix"].as_str()).ok_or_else(|| anyhow!("catalog prefix"))?.to_string();
+        let changes: Vec<serde_json::Value> = staged
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "identifier": {"namespace": s.ident.namespace().clone().inner(), "name": s.ident.name()},
+                    "requirements": s.requirements,
+                    "updates": s.updates,
+                })
+            })
+            .collect();
+        let resp = self.http.post(format!("{}/v1/{prefix}/transactions/commit", self.uri)).json(&serde_json::json!({"table-changes": changes})).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(anyhow!("multi-table commit failed: {status} {}", resp.text().await.unwrap_or_default()));
+        }
         Ok(())
+    }
+
+    /// Whether a table has a snapshot whose summary carries `cdcell.batch=seq`
+    /// (restart roll-forward, design §11.2).
+    pub async fn has_batch(&self, ident: &TableIdent, seq: u64) -> Result<bool> {
+        if !self.catalog.table_exists(ident).await? {
+            return Ok(false);
+        }
+        let table = self.catalog.load_table(ident).await?;
+        let want = seq.to_string();
+        let found = table.metadata().snapshots().any(|s| s.summary().additional_properties.get("cdcell.batch") == Some(&want));
+        Ok(found)
+    }
+
+    pub fn table_ident(ns: &[String], name: &str) -> Result<TableIdent> {
+        Ok(TableIdent::new(NamespaceIdent::from_vec(ns.to_vec())?, name.to_string()))
     }
 }
 

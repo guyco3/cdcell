@@ -59,6 +59,9 @@ struct CellState {
     confirmed_txid: u64,
     committed: (u64, u64),
     dec: Decoder,
+    /// Shadow checkpoint to load before the next apply (after a restart).
+    load_shadow: Option<String>,
+    shadow_key: Option<String>,
     buffer: BTreeMap<(u64, u64, u64), Buffered>,
     blocked_since: Option<Instant>,
 }
@@ -71,6 +74,8 @@ impl CellState {
             confirmed_txid: 0,
             committed: (0, 0),
             dec: Decoder::new(),
+            load_shadow: None,
+            shadow_key: None,
             buffer: BTreeMap::new(),
             blocked_since: None,
         }
@@ -104,6 +109,11 @@ pub struct Pipeline {
     batch_msgs: Vec<MsgId>,
     batch_progress: BTreeMap<String, (u64, u64, i64)>,
     batch_seq: u64,
+    lease_epoch: u64,
+    lease_version: Option<object_store::UpdateVersion>,
+    owner: String,
+    lease_ttl: Duration,
+    processed_bundles: std::collections::HashSet<String>,
     pub stats: Stats,
 }
 
@@ -116,6 +126,7 @@ pub struct Stats {
     pub commits: u64,
     pub gap_fills: u64,
     pub suspects: u64,
+    pub reconciled_bundles: u64,
 }
 
 impl Pipeline {
@@ -132,6 +143,11 @@ impl Pipeline {
             batch_msgs: Vec::new(),
             batch_progress: BTreeMap::new(),
             batch_seq: 0,
+            lease_epoch: 0,
+            lease_version: None,
+            owner: format!("cdcell-{}-{}", std::process::id(), now_us()),
+            lease_ttl: Duration::from_secs(30),
+            processed_bundles: std::collections::HashSet::new(),
             stats: Stats::default(),
         }
     }
@@ -234,6 +250,11 @@ impl Pipeline {
 
     /// Applies confirmed units in order; handles epoch openers and gaps.
     async fn advance(&mut self, cell: &str) -> Result<()> {
+        if let Some(key) = self.cells.get_mut(cell).unwrap().load_shadow.take() {
+            let image = self.state.get(&key).await?.ok_or_else(|| anyhow::anyhow!("shadow checkpoint {key} missing"))?;
+            self.cells.get_mut(cell).unwrap().dec = Decoder::from_image(&image)?;
+            info!(cell, key, "shadow restored from checkpoint");
+        }
         loop {
             let st = self.cells.get_mut(cell).unwrap();
             // An opener of a higher epoch (a confirmed TXID-1 snapshot) moves
@@ -363,7 +384,9 @@ impl Pipeline {
         let epoch = st.epoch.or_else(|| st.buffer.keys().next().map(|k| k.0));
         let Some(epoch) = epoch else { return Ok(()) };
         let from = if st.epoch == Some(epoch) { st.confirmed_txid } else { 0 };
-        let keys = self.src.list(&format!("cells/{cell}/ltx/e{epoch}/0000/")).await?;
+        // every level: L0, L1 folds and L9 snapshots carry final page images
+        // at their max TXID, so any of them can cover a gap (design §7)
+        let keys = self.src.list(&format!("cells/{cell}/ltx/e{epoch}/")).await?;
         let mut added = 0;
         for k in keys {
             if let crate::keys::ObjKey::Ltx { max, min, .. } = crate::keys::parse(&k) {
@@ -380,6 +403,47 @@ impl Pipeline {
         if added > 0 {
             self.stats.gap_fills += 1;
             info!(cell, epoch, from, added, "gap repair fetched units");
+        } else {
+            // fleet mode: per-cell prefixes can be empty; read live bundles
+            self.reconcile_bundles().await?;
+        }
+        Ok(())
+    }
+
+    /// A bundle already processed (from a notification or reconciliation).
+    pub fn mark_bundle(&mut self, key: &str) -> bool {
+        self.processed_bundles.insert(key.to_string())
+    }
+
+    /// Gap source 2 and tail reconciliation (design §7): GET every bundle
+    /// not yet processed. Bundles of live sessions stay until per-cell
+    /// objects cover them, so between both sources every TXID's final state
+    /// is available.
+    pub async fn reconcile_bundles(&mut self) -> Result<()> {
+        let keys = self.src.list("log/").await?;
+        let mut found = 0;
+        for key in keys {
+            let crate::keys::ObjKey::Bundle { node, generation, log_epoch, .. } = crate::keys::parse(&key) else { continue };
+            if !self.mark_bundle(&key) {
+                continue;
+            }
+            let Some(body) = self.src.get(&key).await? else { continue };
+            let got_at = Instant::now();
+            for r in cdcell_core::ltx::decode_bundle(&body)? {
+                self.add(UnitIn {
+                    cell: r.cell,
+                    epoch: r.cell_epoch,
+                    unit: r.unit,
+                    origin: Origin::Bundle { node: node.clone(), generation: generation.clone(), log_epoch },
+                    msg: None,
+                    got_at,
+                });
+            }
+            found += 1;
+        }
+        if found > 0 {
+            self.stats.reconciled_bundles += found;
+            info!(found, "bundle reconciliation fetched bundles");
         }
         Ok(())
     }
@@ -429,58 +493,78 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Commits the batch (design §11.2, v1 subset: one snapshot per table,
-    /// `_cdcell_progress` last, then the checkpoint, then acks).
+    /// Commits the batch (design §11.2):
+    /// shadows → stage tables → create-only manifest → one atomic
+    /// multi-table commit → checkpoint → acks. After a successful commit
+    /// every touched cell's shadow is exactly at its committed point.
     pub async fn commit(&mut self) -> Result<()> {
-        if self.batch.is_empty() && self.batch_msgs.is_empty() {
+        if self.batch.is_empty() && self.batch_progress.is_empty() {
+            for m in std::mem::take(&mut self.batch_msgs) {
+                self.settle(Some(m));
+            }
             return Ok(());
         }
-        self.batch_seq += 1;
-        let seq = self.batch_seq;
-        let props = HashMap::from([("cdcell.batch".to_string(), seq.to_string())]);
+        self.renew_lease().await?;
+        let seq = self.batch_seq + 1;
+        let props = HashMap::from([("cdcell.batch".to_string(), seq.to_string()), ("cdcell.lease-epoch".to_string(), self.lease_epoch.to_string())]);
+        // 1. shadow images at the batch's point, per touched cell
+        let mut cells_doc = serde_json::Map::new();
+        for (cell, (e, t, _)) in &self.batch_progress {
+            let key = format!("shadows/{cell}/{e}-{t}.db");
+            self.state.put(&key, self.cells[cell].dec.pages().to_image()).await?;
+            cells_doc.insert(cell.clone(), serde_json::json!({"epoch": e, "txid": t, "shadow": key}));
+        }
+        // 2. stage every table (data files written, commit captured)
+        let mut staged = Vec::new();
+        let mut tables = Vec::new();
         let mut events = 0;
         for (key, tb) in std::mem::take(&mut self.batch) {
             let (class, table) = key.split_once('/').unwrap();
             let ns = vec!["cdcell".to_string(), iceberg_out::ident(&self.cfg.script), iceberg_out::ident(class)];
             let schema = if tb.kv { iceberg_out::kv_schema()? } else { iceberg_out::change_schema(&tb.info)? };
-            let ident = self
-                .sink
-                .ensure_table(
-                    &ns,
-                    // reserved tables keep their name; user tables go through the identifier rule
-                    &if tb.kv { table.to_string() } else { iceberg_out::ident(table) },
-                    schema,
-                    HashMap::from([("cdcell.original-name".to_string(), table.to_string())]),
-                )
-                .await?;
+            let name = if tb.kv { table.to_string() } else { iceberg_out::ident(table) };
+            let ident = self.sink.ensure_table(&ns, &name, schema, HashMap::from([("cdcell.original-name".to_string(), table.to_string())])).await?;
             events += tb.rows.len();
-            self.sink.append(&ident, &tb.rows, props.clone()).await?;
-        }
-        if !self.batch_progress.is_empty() {
-            let ns = vec!["cdcell".to_string(), iceberg_out::ident(&self.cfg.script)];
-            let ident = self.sink.ensure_table(&ns, "_cdcell_progress", iceberg_out::progress_schema()?, HashMap::new()).await?;
-            let now = now_us();
-            let rows: Vec<OutRow> = self
-                .batch_progress
-                .iter()
-                .map(|(cell, (e, t, ms))| {
-                    OutRow::from([
-                        ("_cell_id".into(), OutValue::Str(cell.clone())),
-                        ("_epoch".into(), OutValue::Long(*e as i64)),
-                        ("_txid".into(), OutValue::Long(*t as i64)),
-                        ("ce_time".into(), OutValue::Ts(ms * 1000)),
-                        ("committed_at".into(), OutValue::Ts(now)),
-                        ("batch".into(), OutValue::Long(seq as i64)),
-                    ])
-                })
-                .collect();
-            self.sink.append(&ident, &rows, props.clone()).await?;
-            for (cell, (e, t, _)) in std::mem::take(&mut self.batch_progress) {
-                if let Some(st) = self.cells.get_mut(&cell) {
-                    st.committed = (e, t);
-                }
+            if let Some(st) = self.sink.stage(&ident, &tb.rows, props.clone()).await? {
+                staged.push(st);
             }
+            tables.push(ns.iter().cloned().chain([name]).collect::<Vec<_>>());
         }
+        let ns = vec!["cdcell".to_string(), iceberg_out::ident(&self.cfg.script)];
+        let pident = self.sink.ensure_table(&ns, "_cdcell_progress", iceberg_out::progress_schema()?, HashMap::new()).await?;
+        let now = now_us();
+        let rows: Vec<OutRow> = self
+            .batch_progress
+            .iter()
+            .map(|(cell, (e, t, ms))| {
+                OutRow::from([
+                    ("_cell_id".into(), OutValue::Str(cell.clone())),
+                    ("_epoch".into(), OutValue::Long(*e as i64)),
+                    ("_txid".into(), OutValue::Long(*t as i64)),
+                    ("ce_time".into(), OutValue::Ts(ms * 1000)),
+                    ("committed_at".into(), OutValue::Ts(now)),
+                    ("batch".into(), OutValue::Long(seq as i64)),
+                ])
+            })
+            .collect();
+        if let Some(st) = self.sink.stage(&pident, &rows, props.clone()).await? {
+            staged.push(st);
+        }
+        tables.push(ns.iter().cloned().chain(["_cdcell_progress".to_string()]).collect());
+        // 3. create-only manifest: a second writer loses here
+        let manifest = serde_json::json!({"version": 1, "seq": seq, "lease_epoch": self.lease_epoch, "tables": tables, "cells": cells_doc});
+        if !self.state.put_new(&format!("batches/{seq:020}.json"), serde_json::to_vec(&manifest)?).await? {
+            anyhow::bail!("batch manifest {seq} already exists: another cdcell is committing");
+        }
+        // 4. atomic multi-table commit
+        self.sink.commit_atomic(staged).await?;
+        self.batch_seq = seq;
+        for (cell, (e, t, _)) in std::mem::take(&mut self.batch_progress) {
+            let st = self.cells.get_mut(&cell).unwrap();
+            st.committed = (e, t);
+            st.shadow_key = Some(format!("shadows/{cell}/{e}-{t}.db"));
+        }
+        // 5. checkpoint, then acks
         self.write_checkpoint(seq).await?;
         for m in std::mem::take(&mut self.batch_msgs) {
             self.settle(Some(m));
@@ -494,10 +578,109 @@ impl Pipeline {
         let cells: serde_json::Map<String, J> = self
             .cells
             .iter()
-            .map(|(c, s)| (c.clone(), serde_json::json!({"epoch": s.committed.0, "committed_txid": s.committed.1})))
+            .filter(|(_, s)| s.shadow_key.is_some())
+            .map(|(c, s)| (c.clone(), serde_json::json!({"epoch": s.committed.0, "txid": s.committed.1, "shadow": s.shadow_key})))
             .collect();
-        let doc = serde_json::json!({"version": 1, "last_batch": seq, "cells": cells});
+        let doc = serde_json::json!({"version": 1, "last_batch": seq, "lease_epoch": self.lease_epoch, "cells": cells});
         self.state.put("checkpoint.json", serde_json::to_vec(&doc)?).await
+    }
+
+    /// Restart (design §11.2): checkpoint, then roll forward every manifest
+    /// whose batch is visibly committed; restore cells at their committed
+    /// points (shadows load lazily). Redelivered units at or below a
+    /// committed point are dropped, so nothing is emitted twice.
+    pub async fn recover(&mut self) -> Result<()> {
+        let mut last = 0;
+        let mut cells: serde_json::Map<String, J> = serde_json::Map::new();
+        if let Some(b) = self.state.get("checkpoint.json").await? {
+            let doc: J = serde_json::from_slice(&b)?;
+            last = doc["last_batch"].as_u64().unwrap_or(0);
+            cells = doc["cells"].as_object().cloned().unwrap_or_default();
+        }
+        let mut highest = last;
+        for key in self.state.list("batches/").await? {
+            let Some(seq) = key.strip_prefix("batches/").and_then(|n| n.strip_suffix(".json")).and_then(|n| n.parse::<u64>().ok()) else { continue };
+            highest = highest.max(seq);
+            if seq <= last {
+                continue;
+            }
+            let Some(b) = self.state.get(&key).await? else { continue };
+            let m: J = serde_json::from_slice(&b)?;
+            let first = m["tables"].as_array().and_then(|t| t.first()).and_then(|t| t.as_array()).cloned().unwrap_or_default();
+            let parts: Vec<String> = first.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+            let committed = match parts.split_last() {
+                Some((name, ns)) => self.sink.has_batch(&Sink::table_ident(ns, name)?, seq).await?,
+                None => false,
+            };
+            if committed {
+                info!(seq, "rolling forward a batch committed after the last checkpoint");
+                for (c, v) in m["cells"].as_object().cloned().unwrap_or_default() {
+                    cells.insert(c, v);
+                }
+                last = seq;
+            } else {
+                info!(seq, "discarding an uncommitted batch (its messages will be redelivered)");
+            }
+        }
+        self.batch_seq = highest;
+        for (cell, v) in cells {
+            let mut st = CellState::new(&cell);
+            st.epoch = v["epoch"].as_u64();
+            st.confirmed_txid = v["txid"].as_u64().unwrap_or(0);
+            st.committed = (st.epoch.unwrap_or(0), st.confirmed_txid);
+            st.shadow_key = v["shadow"].as_str().map(str::to_string);
+            st.load_shadow = st.shadow_key.clone();
+            self.cells.insert(cell, st);
+        }
+        info!(cells = self.cells.len(), last_batch = last, next_batch = highest + 1, "recovered");
+        if last != 0 {
+            self.write_checkpoint(last).await?;
+        }
+        Ok(())
+    }
+
+    /// Global v1 lease (design §3, §11.2): one committing process.
+    pub async fn acquire_lease(&mut self, ttl: Duration) -> Result<()> {
+        loop {
+            let now = now_us() / 1000;
+            let doc = |epoch: u64| serde_json::to_vec(&serde_json::json!({"owner": self.owner, "epoch": epoch, "expires_ms": now + ttl.as_millis() as i64})).unwrap();
+            match self.state.get_versioned("lease.json").await? {
+                None => {
+                    if self.state.put_new("lease.json", doc(1)).await? {
+                        self.lease_epoch = 1;
+                        break;
+                    }
+                }
+                Some((b, ver)) => {
+                    let cur: J = serde_json::from_slice(&b)?;
+                    let expired = cur["expires_ms"].as_i64().unwrap_or(0) < now;
+                    let epoch = cur["epoch"].as_u64().unwrap_or(0) + 1;
+                    if expired || cur["owner"] == self.owner.as_str() {
+                        if self.state.put_if("lease.json", doc(epoch), ver).await? {
+                            self.lease_epoch = epoch;
+                            break;
+                        }
+                    } else {
+                        warn!(holder = %cur["owner"], "another cdcell holds the lease; waiting");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        }
+        self.lease_version = self.state.get_versioned("lease.json").await?.map(|(_, v)| v);
+        self.lease_ttl = ttl;
+        info!(epoch = self.lease_epoch, owner = %self.owner, "lease acquired");
+        Ok(())
+    }
+
+    pub async fn renew_lease(&mut self) -> Result<()> {
+        let Some(ver) = self.lease_version.clone() else { return Ok(()) };
+        let body = serde_json::to_vec(&serde_json::json!({"owner": self.owner, "epoch": self.lease_epoch, "expires_ms": now_us() / 1000 + self.lease_ttl.as_millis() as i64}))?;
+        if !self.state.put_if("lease.json", body, ver).await? {
+            anyhow::bail!("lost the cdcell lease (epoch {}): another process took over", self.lease_epoch);
+        }
+        self.lease_version = self.state.get_versioned("lease.json").await?.map(|(_, v)| v);
+        Ok(())
     }
 
     async fn read_json(&self, key: &str) -> Result<Option<J>> {

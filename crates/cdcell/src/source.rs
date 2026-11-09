@@ -56,6 +56,38 @@ impl Store {
         Ok(keys)
     }
 
+    /// Create-only PUT (If-None-Match: *). Ok(false) if the key exists.
+    pub async fn put_new(&self, key: &str, body: Vec<u8>) -> Result<bool> {
+        let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+        match self.inner.put_opts(&self.path(key), PutPayload::from(body), opts).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) | Err(object_store::Error::Precondition { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// GET with the version needed for a conditional overwrite.
+    pub async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, object_store::UpdateVersion)>> {
+        match self.inner.get(&self.path(key)).await {
+            Ok(r) => {
+                let v = object_store::UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
+                Ok(Some((r.bytes().await?, v)))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Conditional overwrite (If-Match). Ok(false) on a lost race.
+    pub async fn put_if(&self, key: &str, body: Vec<u8>, version: object_store::UpdateVersion) -> Result<bool> {
+        let opts = object_store::PutOptions { mode: object_store::PutMode::Update(version), ..Default::default() };
+        match self.inner.put_opts(&self.path(key), PutPayload::from(body), opts).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::Precondition { .. }) | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<()> {
         self.inner.put(&self.path(key), PutPayload::from(body)).await?;
         Ok(())

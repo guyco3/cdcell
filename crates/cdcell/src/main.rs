@@ -1,5 +1,6 @@
 //! cdcell: CDC from celld Durable Objects to Iceberg.
 
+mod capture;
 mod emit;
 mod iceberg_out;
 mod keys;

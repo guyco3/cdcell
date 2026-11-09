@@ -93,6 +93,13 @@ pub async fn run(cfg: Config) -> Result<()> {
     let sink = crate::iceberg_out::Sink::connect(&cfg.catalog, &cfg.warehouse).await?;
     let mut pipe = Pipeline::new(src.clone(), state, sink, Settings { script: script.clone(), ce_type_prefix: "dev".into(), gap_timeout: cfg.gap_timeout });
 
+    pipe.acquire_lease(Duration::from_secs(30)).await?;
+    pipe.recover().await?;
+    let drop_pct: u64 = std::env::var("CDCELL_TEST_DROP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let reconcile_every = Duration::from_secs(std::env::var("CDCELL_RECONCILE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300));
+    let mut last_reconcile = Instant::now();
+    let mut last_renew = Instant::now();
+
     let nats = async_nats::connect(&cfg.nats_url).await.context("connect to NATS")?;
     let js = jetstream::new(nats);
     let stream = js.get_stream(&cfg.stream).await.context("JetStream stream")?;
@@ -128,6 +135,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             next_id += 1;
             let id = next_id;
             let mut units = Vec::new();
+            // Test knob (M5 gate): lose N% of notifications.
+            if drop_pct > 0 && (id.wrapping_mul(2654435761) % 100) < drop_pct {
+                pipe.track(id, 0);
+                held.insert(id, msg);
+                continue;
+            }
             for key in keys_of(&msg.payload, &cfg.source_prefix) {
                 let parsed = keys::parse(&key);
                 let got_at = Instant::now();
@@ -141,6 +154,9 @@ pub async fn run(cfg: Config) -> Result<()> {
                         }
                     }
                     ObjKey::Bundle { node, generation, log_epoch, .. } => {
+                        if !pipe.mark_bundle(&key) {
+                            continue; // already read by reconciliation
+                        }
                         if let Some(body) = src.get(&key).await? {
                             match cdcell_core::ltx::decode_bundle(&body) {
                                 Ok(rows) => units.extend(rows.into_iter().map(|r| UnitIn {
@@ -164,7 +180,15 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             held.insert(id, msg);
         }
-        // 2. confirm + apply
+        // 2. confirm + apply; periodic tail reconciliation and lease renewal
+        if last_reconcile.elapsed() >= reconcile_every {
+            pipe.reconcile_bundles().await?;
+            last_reconcile = Instant::now();
+        }
+        if last_renew.elapsed() >= Duration::from_secs(10) {
+            pipe.renew_lease().await?;
+            last_renew = Instant::now();
+        }
         pipe.round().await?;
         // 3. commit
         if last_commit.elapsed() >= cfg.commit_interval {

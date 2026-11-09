@@ -26,3 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 percent-encoding = "2"
 sha2 = "0.10"
 bytes = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
