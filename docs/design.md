@@ -161,13 +161,46 @@ only full image ends *beyond* the committed point (celld folded the history
 into an L1 while cdcell was down), **resync**: emit the image's rows as
 updates plus deletes for keys live in the cell's own change log but absent
 from the image, as one net change at the image's `(epoch, txid)`
-(`tests/m5-l1-resync.sh`). Intermediate versions in that window are lost;
+(`tests/m5-l1-resync.sh`). If the committed epoch itself is gone (celld's
+opt-in epoch GC, `CELLD_LTX_RETENTION_SECS`), resync the same way from the
+newest full image in the owner's current epoch named by `own.json`; that
+epoch is history, phantoms only live in fenced owners' older epochs
+(`tests/m5-epoch-gc.sh`). Intermediate versions in that window are lost;
 the final state is exact.
 
 A global lease (`_cdcell/lease.json`, conditional PUT, TTL) lets one process
 commit; a lost renewal stops the process.
 
-## 7. Many workers (after v1)
+## 7. Operating requirements
+
+cdcell's guarantees (§1) hold only while the deployment provides these.
+Breaking one is outside the contract, not a cdcell bug:
+
+1. **Notification coverage.** Every object created under `cells/` and `log/`
+   in the celld bucket produces a notification to cdcell's queue.
+2. **Queue retention.** The queue keeps unacknowledged notifications longer
+   than cdcell's longest outage (SQS allows up to 14 days; JetStream: the
+   stream's `max_age`).
+3. **Read access** to the celld bucket per `deploy/iam/celld-read-policy.json`,
+   and read/write to the lake bucket and the Iceberg catalog.
+4. **One cdcell process per celld deployment** (v1). A second one is fenced
+   by the lease but adds nothing.
+5. **celld's storage guarantees** (strong read-after-write, list-after-write;
+   celld `docs/guarantees.md`).
+
+**History detail is a choice, not a requirement.** cdcell emits one version
+per celld TXID while it keeps up with celld's compaction window: until an L1
+covers a range (`CELLD_LTX_COMPACTION_MIN_TXIDS`, default 256 TXIDs, or
+`CELLD_LTX_COMPACTION_MIN_MB`), plus ~30-40 s of bundle GC delay. When cdcell
+falls further behind (an outage, a backlog), it emits one net change for each
+compacted range: current state stays exact, intermediate versions inside the
+range are absent from type 2. Raising the compaction thresholds widens the
+window at the cost of slower celld takeovers and more objects. With epoch GC
+enabled (`CELLD_LTX_RETENTION_SECS`), cdcell still recovers (§6), at the same
+net-change granularity. One SQLite transaction is the finest grain that
+exists: celld stores changed pages, not statements.
+
+## 8. Many workers (after v1)
 
 Partition cells by hash; one lease per partition with its epoch stamped on
 every commit; a handoff commits, checkpoints and releases before the next
@@ -176,7 +209,7 @@ each worker gets every notification (its own queue/consumer) and keeps its
 partitions' cells; one checkpoint per partition. Schema changes to shared
 tables are optimistic (assert the current schema id; reload and retry).
 
-## 8. Operations
+## 9. Operations
 
 Prometheus on `:9464`: `cdcell_watermark_age_seconds_{max,p99}`,
 `cdcell_parked_cells`, `cdcell_parked_age_seconds_max`, `cdcell_open_gaps`,
@@ -199,7 +232,7 @@ confirmations and schema reads are small. With commits every 15-60 min and,
 in fleet mode, a LIST of live sessions instead of SQS, roughly $0.40 per 1M
 objects plus a small always-on worker.
 
-## 9. Status
+## 10. Status
 
 | | |
 |---|---|

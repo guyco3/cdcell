@@ -106,7 +106,7 @@ restarted, notification stream purged, cdcell state and output tables
 dropped. Waits are "until caught up" (watermark < 30 s, no open gaps), not
 fixed sleeps.
 
-`scripts/all-gates.sh` runs everything below in sequence and prints one
+`scripts/all-gates.sh` runs the regular set below (`SLOW=1` adds the slow set: `tests/m5-epoch-gc.sh`, ~10 min) in sequence and prints one
 PASS/FAIL line per gate (logs in `/tmp/cdcell-gates/`).
 
 | Script | What it proves |
@@ -116,6 +116,7 @@ PASS/FAIL line per gate (logs in `/tmp/cdcell-gates/`).
 | `scripts/m4-gate.sh` | pause / stall / zombie / docker-kill of the busiest node; parked suspects resolved by later epochs' openers |
 | `scripts/m5-gate.sh [crash lost outage]` | kill -9 cdcell under load; ~25% of notifications deleted incl. the last; outage past bundle GC |
 | `tests/m5-l1-resync.sh` | cdcell down while a shop passes celld's L1 fold and its bundles are GC'd: resync from the later image |
+| `tests/m5-epoch-gc.sh` | celld epoch GC on (`CELLD_LTX_RETENTION_SECS=5`, this test only); cdcell down while a shop moves epochs and its committed epoch is deleted: resync from the owner's current epoch (~10 min: celld runs a GC pass at most every 5 min) |
 | `tests/m5-no-shadows.sh` | no copy of celld state in the customer bucket; kill -9 and rebuild from celld |
 | `tests/r5-schema-evolution.sh` | a deploy with a schema migration (`worker/shop-v2`): idle, active, untouched and new objects; `__schema_version` per object |
 | `tests/m5-bootstrap.sh` | a fresh cdcell catches up on cells with long histories (`SHOPS="m4-<ts>-01 …"`) |

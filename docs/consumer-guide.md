@@ -46,10 +46,12 @@ Sets and binary are tagged: `{"$date": …}`, `{"$bigint": "…"}`, `{"$map": [�
 4. **Duplicates can appear after a cdcell crash.** They have the same
    `(__cell_id, __key, __epoch, __txid)`; merge with a version guard (below)
    or deduplicate on those four columns.
-5. **A long cdcell outage can collapse history.** If celld compacted a
-   Durable Object's history while cdcell was down, cdcell emits one net
-   change (updates plus deletes) at the compacted point. Current state stays
-   exact; versions inside that window are missing from type 2.
+5. **History is per transaction while cdcell keeps up.** If cdcell falls
+   behind celld's compaction window (an outage, a backlog), it emits one net
+   change (updates plus deletes) per compacted range. Current state stays
+   exact; versions inside that range are missing from type 2. Operators can
+   widen the window with celld's `CELLD_LTX_COMPACTION_MIN_TXIDS` /
+   `_MIN_MB` (design §7, operating requirements).
 6. **NULLs are values.** A row re-created with NULL columns must not pick up
    older non-NULL values. In ClickHouse, `argMax(col, v)` skips NULLs: use
    `argMax(tuple(col), v).1` (or `argMax(tuple(*), v)`).

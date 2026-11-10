@@ -374,6 +374,33 @@ impl Pipeline {
                         return Ok(true);
                     }
                 }
+                // The committed epoch itself may be gone: celld's epoch GC
+                // (opt-in, CELLD_LTX_RETENTION_SECS) deletes prefixes below
+                // the restore base. Resync from the newest full image in the
+                // owner's current epoch: own.json names it, so it is history
+                // (phantoms only live in fenced owners' older epochs).
+                let own_epoch = self
+                    .read_json(&format!("cells/{cell}/own.json"))
+                    .await?
+                    .and_then(|j| j.get("epoch").and_then(|e| e.as_u64()));
+                if let Some(e) = own_epoch.filter(|&e| e > epoch) {
+                    let newest = self
+                        .src
+                        .list(&format!("cells/{cell}/ltx/e{e}/"))
+                        .await?
+                        .into_iter()
+                        .filter_map(|k| match crate::keys::parse(&k) {
+                            crate::keys::ObjKey::Ltx { min: 1, max, .. } => Some((max, k)),
+                            _ => None,
+                        })
+                        .max_by_key(|(m, _)| *m);
+                    if let Some((_, k)) = newest {
+                        if let Some(u) = self.fetch_units(vec![k]).await?.pop() {
+                            self.resync_later(cell, e, committed, u).await?;
+                            return Ok(true);
+                        }
+                    }
+                }
                 self.cells.get_mut(cell).unwrap().blocked_since = Some(Instant::now());
                 self.reconcile_bundles().await?; // the base may be a live bundle row
             }
@@ -574,7 +601,7 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Gap, parking and watermark-age gauges (design §8).
+    /// Gap, parking and watermark-age gauges (design §9).
     fn update_gauges(&self) {
         let now_ms = now_us() / 1000;
         let mut ages: Vec<f64> = Vec::new();
@@ -585,7 +612,7 @@ impl Pipeline {
                 gaps += 1;
             }
             // Parked cells (suspects awaiting a later epoch's opener) are
-            // tracked apart from the watermark (design §8).
+            // tracked apart from the watermark (design §9).
             if st.buffer.values().any(|b| b.verdict == Verdict::Suspect) {
                 parked += 1;
                 if let Some(t) = st.buffer.values().map(|b| b.u.unit.timestamp_ms).min() {
