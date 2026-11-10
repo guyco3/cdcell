@@ -2,7 +2,7 @@
 # Run every gate and test in sequence; print one PASS/FAIL line each.
 #   all-gates.sh [names...]   (default: all)
 cd "$(dirname "$0")/.."
-ALL="scripts/m2-gate.sh scripts/m3-gate.sh scripts/m4-gate.sh scripts/m5-gate.sh tests/m5-no-shadows.sh tests/m5-l1-resync.sh tests/m5-bootstrap.sh tests/r5-schema-evolution.sh tests/m6-metrics.sh tests/m6-maintenance.sh tests/m6-iam.sh"
+ALL="scripts/m2-gate.sh scripts/m3-gate.sh scripts/m4-gate.sh scripts/m5-gate.sh tests/m5-no-shadows.sh tests/m5-l1-resync.sh tests/m5-epoch-gc.sh tests/m5-bootstrap.sh tests/r5-schema-evolution.sh tests/m6-metrics.sh tests/m6-maintenance.sh tests/m6-iam.sh"
 LOG=${LOG:-/tmp/cdcell-gates}; mkdir -p "$LOG"
 fails=0
 for t in ${@:-$ALL}; do

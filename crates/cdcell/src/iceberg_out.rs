@@ -182,7 +182,7 @@ pub fn ident(name: &str) -> String {
     }
 }
 
-/// Table properties cdcell maintains on its tables (design §8).
+/// Table properties cdcell maintains on its tables (design §9).
 pub const TABLE_PROPERTIES: [(&str, &str); 2] = [
     ("write.metadata.delete-after-commit.enabled", "true"),
     ("write.metadata.previous-versions-max", "100"),
@@ -625,7 +625,7 @@ impl Sink {
     }
 
     /// Expires snapshots older than `older_than_ms` beyond the newest
-    /// `retain_last`, and sets the maintenance properties (design §8).
+    /// `retain_last`, and sets the maintenance properties (design §9).
     pub async fn maintain(
         &self,
         ident: &TableIdent,
