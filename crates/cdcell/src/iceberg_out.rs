@@ -198,8 +198,21 @@ pub struct Sink {
 /// One table's staged change, ready for an atomic multi-table commit.
 pub struct Staged {
     pub ident: TableIdent,
-    pub requirements: Vec<iceberg::TableRequirement>,
-    pub updates: Vec<iceberg::TableUpdate>,
+    pub(crate) body: StagedBody,
+}
+
+pub(crate) enum StagedBody {
+    /// A captured catalog commit (requirements + updates) for the REST
+    /// multi-table transaction.
+    Rest {
+        requirements: Vec<iceberg::TableRequirement>,
+        updates: Vec<iceberg::TableUpdate>,
+    },
+    /// Rows staged in a [`crate::out::MemSink`].
+    Mem {
+        rows: Vec<OutRow>,
+        props: HashMap<String, String>,
+    },
 }
 
 impl Sink {
@@ -392,8 +405,10 @@ impl Sink {
             .ok_or_else(|| anyhow!("no captured commit"))?;
         Ok(Some(Staged {
             ident: commit.identifier().clone(),
-            requirements: commit.take_requirements(),
-            updates: commit.take_updates(),
+            body: StagedBody::Rest {
+                requirements: commit.take_requirements(),
+                updates: commit.take_updates(),
+            },
         }))
     }
 
@@ -419,14 +434,15 @@ impl Sink {
             .to_string();
         let changes: Vec<serde_json::Value> = staged
             .into_iter()
-            .map(|s| {
-                serde_json::json!({
+            .map(|s| match s.body {
+                StagedBody::Rest { requirements, updates } => Ok(serde_json::json!({
                     "identifier": {"namespace": s.ident.namespace().clone().inner(), "name": s.ident.name()},
-                    "requirements": s.requirements,
-                    "updates": s.updates,
-                })
+                    "requirements": requirements,
+                    "updates": updates,
+                })),
+                StagedBody::Mem { .. } => Err(anyhow!("in-memory staged change sent to the REST catalog")),
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let resp = self
             .http
             .post(format!("{}/v1/{prefix}/transactions/commit", self.uri))

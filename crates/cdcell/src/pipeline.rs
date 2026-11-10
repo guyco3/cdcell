@@ -8,7 +8,10 @@
 //! the committer appends the batch to Iceberg and settles the units' messages.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// tokio's clock, so tests can pause and advance time (gap timeouts, leases).
+use tokio::time::Instant;
 
 use anyhow::Result;
 use serde_json::Value as J;
@@ -19,7 +22,8 @@ use cdcell_core::schema::{is_internal, TableInfo};
 use cdcell_core::Decoder;
 
 use crate::emit::{self, Kind};
-use crate::iceberg_out::{self, OutRow, OutValue, Sink};
+use crate::iceberg_out::{self, OutRow, OutValue};
+use crate::out::Out;
 use crate::source::Store;
 
 pub type MsgId = u64;
@@ -110,7 +114,7 @@ struct TableBatch {
 pub struct Pipeline {
     src: Store,
     state: Store,
-    sink: Sink,
+    sink: Box<dyn Out>,
     cfg: Settings,
     cells: HashMap<String, CellState>,
     /// message → units not yet settled
@@ -142,7 +146,7 @@ pub struct Stats {
 }
 
 impl Pipeline {
-    pub fn new(src: Store, state: Store, sink: Sink, cfg: Settings) -> Pipeline {
+    pub fn new(src: Store, state: Store, sink: Box<dyn Out>, cfg: Settings) -> Pipeline {
         Pipeline {
             src,
             state,
@@ -1264,7 +1268,7 @@ impl Pipeline {
             let committed = match parts.split_last() {
                 Some((name, ns)) => {
                     self.sink
-                        .has_batch(&Sink::table_ident(ns, name)?, seq)
+                        .has_batch(&iceberg_out::Sink::table_ident(ns, name)?, seq)
                         .await?
                 }
                 None => false,
@@ -1381,9 +1385,26 @@ impl Pipeline {
     }
 }
 
-pub fn now_us() -> i64 {
+static TEST_CLOCK: std::sync::OnceLock<(i64, Instant)> = std::sync::OnceLock::new();
+
+/// Tests: derive the wall clock from tokio's clock (start time + elapsed),
+/// so paused and advanced time moves lease expiry and capture times too.
+/// Production never calls this and reads the system clock.
+pub fn use_test_clock() {
+    TEST_CLOCK.get_or_init(|| (system_us(), Instant::now()));
+}
+
+fn system_us() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
+}
+
+/// Wall clock, µs since the epoch: lease expiry, `__ingested_at`.
+pub fn now_us() -> i64 {
+    match TEST_CLOCK.get() {
+        Some((start_us, start)) => start_us + start.elapsed().as_micros() as i64,
+        None => system_us(),
+    }
 }

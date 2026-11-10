@@ -22,7 +22,7 @@ nats consumer rm CELLD cdcell -f >/dev/null 2>&1 || true
 docker rm -f cdcell-run >/dev/null 2>&1 || true
 docker run -d --name cdcell-run --network "$NET" -p 9464:9464 -v cdcell-target:/t \
   -e RUST_LOG=info,iceberg=warn -e CDCELL_COMMIT_INTERVAL_S=10 -e CDCELL_GAP_TIMEOUT_S=15 \
-  celld-cdc/rust-dev:1.98.1 /t/debug/cdcell run >/dev/null
+  cdcell/rust-dev:1.98.1 /t/debug/cdcell run >/dev/null
 sleep 5
 echo "== seed load ($SHOP_PREFIX-01..10)"; ./scripts/load.sh 200 6 10
 

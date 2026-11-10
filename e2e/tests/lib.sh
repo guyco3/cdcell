@@ -11,7 +11,7 @@ start_cdcell() {
   docker rm -f cdcell-run >/dev/null 2>&1 || true
   docker run -d --name cdcell-run --network "$NET" -p 9464:9464 -v "$TARGET_VOL:/t" \
     -e RUST_LOG=info,iceberg=warn -e CDCELL_COMMIT_INTERVAL_S=10 -e CDCELL_GAP_TIMEOUT_S=15 -e CDCELL_RECONCILE_S=30 \
-    "$@" celld-cdc/rust-dev:1.98.1 "$CDCELL_BIN" run >/dev/null
+    "$@" cdcell/rust-dev:1.98.1 "$CDCELL_BIN" run >/dev/null
 }
 stop_cdcell() { docker rm -f cdcell-run >/dev/null 2>&1 || true; }
 # Wipe celld's runtime state (cells, logs, leases, wake/drain records) so

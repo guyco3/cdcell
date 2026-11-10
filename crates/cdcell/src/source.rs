@@ -39,6 +39,23 @@ impl Store {
         })
     }
 
+    /// An in-memory store (tests and simulation): same conditional-PUT
+    /// semantics as S3 (create-only, If-Match by ETag).
+    pub fn memory() -> Store {
+        Store {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: String::new(),
+        }
+    }
+
+    /// DELETE (tests: celld's bundle and epoch GC). Missing keys are fine.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        match self.inner.delete(&self.path(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn path(&self, key: &str) -> Path {
         Path::from(format!("{}{}", self.prefix, key))
     }
