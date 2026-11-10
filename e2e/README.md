@@ -31,6 +31,7 @@ python3 -I tools/inspect.py cells      # owner, epoch, LTX objects per epoch/lev
 caffeinate -i ./scripts/zombie-test.sh zombie   # late bundle after recovery
 caffeinate -i ./scripts/cdc-up.sh      # customer side: CDC MinIO, Lakekeeper, ClickHouse
 ./scripts/m0-verify.sh                 # M0 gate: Iceberg via Lakekeeper, read by ClickHouse
+../scripts/cargo.sh build -p cdcell    # the debug build the gates and tests run (volume cdcell-target)
 docker compose down -v                 # tear down, including data
 ```
 
@@ -86,3 +87,59 @@ First `zombie` run (2026-11-07): 12 bundles CONFIRMED and all in history;
 bundle seq 12 landed 7.5 s after recovery sealed (`bundles_read=12`),
 classified SUSPECT, and all its rows (tx 267-292 on 8 cells) were already
 in history because recovery had gathered them from the followers' disks.
+
+## cdcell gates and tests
+
+Each gate starts cdcell in container `cdcell-run` (binary from the
+`cdcell-target` volume) with clean output and state, loads fresh shops through
+the load balancer, and ends with `tools/verify_type1.py`: ClickHouse type-1
+views of the change log (latest row per `(__cell_id, __key)` by
+`(__epoch, __txid)`, deletes removed) compared field by field with the shop's
+own `?op=dump` (orders, WITHOUT ROWID items, overflow attachments, V8-decoded
+KV values, migrated columns), plus no duplicate
+`(__cell_id, __key, __epoch, __txid)`.
+
+Every gate and test starts from the same clean state (`tests/lib.sh`
+`fresh`): celld's runtime state wiped (`cells/`, `log/`, `nodes/`, `wake/`,
+`drain/`; the deployed Worker code and fleet secret are kept) and the nodes
+restarted, notification stream purged, cdcell state and output tables
+dropped. Waits are "until caught up" (watermark < 30 s, no open gaps), not
+fixed sleeps.
+
+`scripts/all-gates.sh` runs everything below in sequence and prints one
+PASS/FAIL line per gate (logs in `/tmp/cdcell-gates/`).
+
+| Script | What it proves |
+|---|---|
+| `scripts/m2-gate.sh` | single-node celld (per-cell L0 + `own.json` confirmation) |
+| `scripts/m3-gate.sh` | 3-node fleet (bundles + writer-lease confirmation) |
+| `scripts/m4-gate.sh` | pause / stall / zombie / docker-kill of the busiest node; parked suspects resolved by later epochs' openers |
+| `scripts/m5-gate.sh [crash lost outage]` | kill -9 cdcell under load; ~25% of notifications deleted incl. the last; outage past bundle GC |
+| `tests/m5-l1-resync.sh` | cdcell down while a shop passes celld's L1 fold and its bundles are GC'd: resync from the later image |
+| `tests/m5-no-shadows.sh` | no copy of celld state in the customer bucket; kill -9 and rebuild from celld |
+| `tests/r5-schema-evolution.sh` | a deploy with a schema migration (`worker/shop-v2`): idle, active, untouched and new objects; `__schema_version` per object |
+| `tests/m5-bootstrap.sh` | a fresh cdcell catches up on cells with long histories (`SHOPS="m4-<ts>-01 …"`) |
+| `tests/m6-metrics.sh` | Prometheus metrics on `:9464` |
+| `tests/m6-maintenance.sh` | `cdcell maintain`: snapshot expiry, metadata-cleanup property, data intact |
+| `tests/m6-iam.sh` | `deploy/iam/celld-read-policy.json`: cdcell works with it; secrets, app data and Worker code are denied |
+| `tests/m6-soak.sh` | `SOAK_MIN` (default 60) at load: lag p99 < 120 s after catch-up, GETs per celld object within ±20% of the model |
+
+`tests/lib.sh` gives each test a fresh start: fleet up, NATS consumer
+removed and stream purged, `_cdcell/` state and every `cdcell.*` table
+dropped. Shops are named per run (`SHOP_PREFIX`), so runs never share data.
+
+**Red runs.** Tests are written first and run against the previous build:
+check out the older commit in a worktree next to this repo, build it into
+another volume, and point the test at it:
+
+```sh
+git worktree add ../cdcell-old <commit>
+docker run --rm -v ~/dev:/work -w /work/cdcell-old -v cdcell-cargo-registry:/usr/local/cargo/registry \
+  -v cdcell-old-target:/work/cdcell-old/target celld-cdc/rust-dev:1.98.1 cargo build -p cdcell
+TARGET_VOL=cdcell-old-target ./scripts/m5-gate.sh lost     # expect FAIL
+```
+
+**Debugging lag.** `docker logs cdcell-run | grep "lagging cell"` lists the
+cells with the oldest pending work each commit (epoch, confirmed TXID,
+buffered units and their verdicts, blocked or not).
+

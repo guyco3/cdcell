@@ -21,7 +21,7 @@ nats() { docker run --rm --network "$NET" natsio/nats-box:latest nats -s nats://
 settle() { for _ in $(seq 1 40); do n=$(python3 -I tools/inspect.py leases | grep -c '"log_state": "open"' || true); [ "$n" -ge 3 ] && return; sleep 2; done; }
 start_cdcell() {
   docker rm -f cdcell-run >/dev/null 2>&1 || true
-  docker run -d --name cdcell-run --network "$NET" -v "$TARGET_VOL:/t" \
+  docker run -d --name cdcell-run --network "$NET" -p 9464:9464 -v "$TARGET_VOL:/t" \
     -e RUST_LOG=info,iceberg=warn -e CDCELL_COMMIT_INTERVAL_S=10 -e CDCELL_GAP_TIMEOUT_S=15 -e CDCELL_RECONCILE_S=30 \
     celld-cdc/rust-dev:1.98.1 "$CDCELL_BIN" run >/dev/null
 }
@@ -31,6 +31,8 @@ stop_cdcell() { docker kill cdcell-run >/dev/null 2>&1 || true; docker rm -f cdc
 docker compose start celld-a celld-b celld-c >/dev/null; settle
 stop_cdcell
 nats consumer rm CELLD cdcell -f >/dev/null 2>&1 || true
+# clean, constant starting state: empty celld fleet, stream, cdcell state, output
+( source tests/lib.sh; fresh )
 mc rm --recursive --force cdc/warehouse/_cdcell/ >/dev/null 2>&1 || true
 start_cdcell; sleep 5
 echo "== seed load ($SHOP_PREFIX-01..06)"; ./scripts/load.sh 120 6 6
@@ -66,6 +68,6 @@ for s in $SCENARIOS; do
 done
 
 echo "== final write to every shop"; ./scripts/load.sh 30 4 6
-sleep 60
+( source tests/lib.sh; wait_caught_up )
 docker logs cdcell-run 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "committed batch|recovered|rolling|reconcil|gap repair|ERROR|Error" | tail -6 | cut -c1-240
 python3 -I tools/verify_type1.py --shops $(seq -f "$SHOP_PREFIX-%02g" 1 6) && echo "M5: PASS"

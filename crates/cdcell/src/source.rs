@@ -36,15 +36,20 @@ impl Store {
 
     /// GET; `None` when the object no longer exists (GC'd, design §4.3).
     pub async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        crate::metrics::inc(&crate::metrics::M.s3_get);
         match self.inner.get(&self.path(key)).await {
             Ok(r) => Ok(Some(r.bytes().await?)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(object_store::Error::NotFound { .. }) => {
+                crate::metrics::inc(&crate::metrics::M.not_found);
+                Ok(None)
+            }
             Err(e) => Err(e.into()),
         }
     }
 
     /// Keys under `prefix` (relative to the store prefix), sorted.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        crate::metrics::inc(&crate::metrics::M.s3_list);
         let p = self.path(prefix);
         let mut keys: Vec<String> = self
             .inner
@@ -58,6 +63,7 @@ impl Store {
 
     /// Create-only PUT (If-None-Match: *). Ok(false) if the key exists.
     pub async fn put_new(&self, key: &str, body: Vec<u8>) -> Result<bool> {
+        crate::metrics::inc(&crate::metrics::M.s3_put);
         let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
         match self.inner.put_opts(&self.path(key), PutPayload::from(body), opts).await {
             Ok(_) => Ok(true),
@@ -68,6 +74,7 @@ impl Store {
 
     /// GET with the version needed for a conditional overwrite.
     pub async fn get_versioned(&self, key: &str) -> Result<Option<(Bytes, object_store::UpdateVersion)>> {
+        crate::metrics::inc(&crate::metrics::M.s3_get);
         match self.inner.get(&self.path(key)).await {
             Ok(r) => {
                 let v = object_store::UpdateVersion { e_tag: r.meta.e_tag.clone(), version: r.meta.version.clone() };
@@ -80,6 +87,7 @@ impl Store {
 
     /// Conditional overwrite (If-Match). Ok(false) on a lost race.
     pub async fn put_if(&self, key: &str, body: Vec<u8>, version: object_store::UpdateVersion) -> Result<bool> {
+        crate::metrics::inc(&crate::metrics::M.s3_put);
         let opts = object_store::PutOptions { mode: object_store::PutMode::Update(version), ..Default::default() };
         match self.inner.put_opts(&self.path(key), PutPayload::from(body), opts).await {
             Ok(_) => Ok(true),
@@ -89,6 +97,7 @@ impl Store {
     }
 
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<()> {
+        crate::metrics::inc(&crate::metrics::M.s3_put);
         self.inner.put(&self.path(key), PutPayload::from(body)).await?;
         Ok(())
     }

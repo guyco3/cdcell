@@ -1,63 +1,80 @@
-//! Row changes → output rows (design §8.2-§8.5, §8.9).
+//! Row changes → change-log rows (design rev 5 contract, §8).
+//!
+//! One append-only table per (script, class, SQLite table). Meta columns use
+//! Debezium's flattened-record convention (double underscore):
+//!
+//! | column | meaning |
+//! |---|---|
+//! | `__cell_id` | the Durable Object, `Class:<64 hex>` |
+//! | `__epoch`, `__txid` | truthful order; compare as the pair |
+//! | `__op` | `c` / `u` / `d` / `r` (bootstrap) |
+//! | `__key` | canonical JSON array of the primary key |
+//! | `__ts` | capture time (owner wall clock; display only) |
+//! | `__schema_version` | the cell's table schema version (registry) |
+//! | `__ingested_at` | when cdcell produced the row |
+//! | `__raw` | values that do not fit their column type, JSON-encoded |
+//!
+//! then the table's own columns: after values for c/u/r, only the key
+//! columns for d. User columns starting with `__` are written as `u__…`.
 
 use std::collections::BTreeMap;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use sha2::{Digest, Sha256};
 
 use cdcell_core::schema::{Affinity, TableInfo};
 use cdcell_core::value::key_json;
-use cdcell_core::{RowChange, Value};
+use cdcell_core::{Op, RowChange, Value};
 
 use crate::iceberg_out::{OutRow, OutValue};
 
-pub const CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Row key holding the table-schema fingerprint until the committer maps
+/// it to `__schema_version` (never written).
+pub const FINGERPRINT: &str = "\u{0}fingerprint";
 
-/// What the event is (design §8.4, §8.5 id namespaces).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Streamed,
+    /// Re-emission after a resolution or rebuild (design §5.4, §10).
     Synthetic,
-    Bootstrap { first: bool, last: bool },
+    /// Initial state of a cell with no committed history.
+    Bootstrap,
 }
 
-/// Per-unit context shared by the unit's events.
 #[derive(Clone, Debug)]
 pub struct Ctx<'a> {
-    pub script: &'a str,
-    pub class: &'a str,
     pub cell: &'a str,
     pub epoch: u64,
     pub txid: u64,
     /// LTX header capture time, ms.
     pub capture_ms: i64,
-    /// Processing time, µs.
     pub now_us: i64,
-    pub ce_type_prefix: &'a str,
-    pub schema_version: u32,
     pub kind: Kind,
 }
 
-const PATH_SEG: &AsciiSet = &CONTROLS.add(b'/').add(b'%').add(b' ');
-const SUBJECT: &AsciiSet = &CONTROLS.add(b'/').add(b'%').add(b' ').add(b'"').add(b'[').add(b']').add(b',').add(b'{').add(b'}').add(b':');
-
-pub fn ce_source(script: &str, class: &str, cell: &str) -> String {
-    format!("/cdcell/sqlite/{}/{}/{}", utf8_percent_encode(script, PATH_SEG), utf8_percent_encode(class, PATH_SEG), utf8_percent_encode(cell, PATH_SEG))
+/// Output column name for a SQLite column (meta columns are reserved).
+pub fn out_col(name: &str) -> String {
+    if name.starts_with("__") {
+        format!("u{name}")
+    } else {
+        name.to_string()
+    }
 }
 
-pub fn ce_id(kind: Kind, epoch: u64, txid: u64, table: &str, pk_json: &str) -> String {
-    let h = Sha256::digest(pk_json.as_bytes());
-    let hex: String = h[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let prefix = match kind {
-        Kind::Streamed => "",
-        Kind::Synthetic => "s:",
-        Kind::Bootstrap { .. } => "r:",
-    };
-    format!("{prefix}{epoch}:{txid}:{table}:{hex}")
+/// Fingerprint of a table schema: the normalized column list (design
+/// rev 5 schema registry). Cells that reached the same columns through
+/// different migrations share it.
+pub fn fingerprint(info: &TableInfo) -> String {
+    let mut h = Sha256::new();
+    h.update(if info.without_rowid { b"wr;" as &[u8] } else { b"rowid;" });
+    for (i, c) in info.columns.iter().enumerate() {
+        let pk = info.pk.iter().position(|&p| p == i).map_or(0, |p| p + 1);
+        h.update(format!("{}|{}|{}|{}|{}|{:?};", c.name, c.decl_type.trim().to_ascii_uppercase(), pk, c.not_null, c.default.to_json(), c.generated).as_bytes());
+    }
+    h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// SQLite value → typed column value, or `None` when it does not fit the
-/// column type (it then goes to `_raw`, design §8.3).
+/// column's affinity (it then goes to `__raw`, design §8.3).
 fn typed(v: &Value, aff: Affinity) -> Option<OutValue> {
     const EXACT: i64 = 1 << 53;
     Some(match (aff, v) {
@@ -72,183 +89,98 @@ fn typed(v: &Value, aff: Affinity) -> Option<OutValue> {
     })
 }
 
-fn image(info: &TableInfo, row: &[(String, Value)], raw: &mut Vec<(String, String)>, record_raw: bool) -> OutValue {
-    let mut m = BTreeMap::new();
-    for (name, v) in row {
-        let aff = info.columns.iter().find(|c| &c.name == name).map_or(Affinity::Untyped, |c| c.affinity);
-        match typed(v, aff) {
-            Some(t) => {
-                m.insert(name.clone(), t);
-            }
-            None => {
-                m.insert(name.clone(), OutValue::Null);
-                if record_raw {
-                    raw.push((name.clone(), v.to_json()));
-                }
-            }
-        }
-    }
-    OutValue::Struct(m)
-}
-
-fn key_struct(info: &TableInfo, key: &[Value]) -> OutValue {
-    let mut m = BTreeMap::new();
-    if info.pk.is_empty() {
-        m.insert("rowid".into(), match key.first() {
-            Some(Value::Integer(i)) => OutValue::Long(*i),
-            _ => OutValue::Null,
-        });
-    } else if key.len() == info.pk.len() {
-        for (&c, v) in info.pk.iter().zip(key) {
-            let col = &info.columns[c];
-            m.insert(col.name.clone(), typed(v, col.affinity).unwrap_or(OutValue::Null));
-        }
-    } else {
-        return OutValue::Null; // rowid fallback for a NULL PK: `_key_json` carries it
-    }
-    OutValue::Struct(m)
-}
-
-/// The CloudEvents / Debezium fields every row carries (design §8.2).
-#[allow(clippy::too_many_arguments)]
-fn base(ctx: &Ctx<'_>, table: &str, pk: &str, op: &str, snapshot: &str, total: i64, dco: i64) -> OutRow {
-    let s = |v: &str| OutValue::Str(v.to_string());
+fn meta(ctx: &Ctx<'_>, op: &str, pk: &str) -> OutRow {
     let mut r: OutRow = BTreeMap::new();
-    r.insert("ce_id".into(), s(&ce_id(ctx.kind, ctx.epoch, ctx.txid, table, pk)));
-    r.insert("ce_source".into(), s(&ce_source(ctx.script, ctx.class, ctx.cell)));
-    r.insert("ce_specversion".into(), s("1.0"));
-    r.insert("ce_type".into(), s(&format!("{}.cdcell.sqlite.DataChangeEvent", ctx.ce_type_prefix)));
-    r.insert("ce_subject".into(), s(&format!("{}/{}", table, utf8_percent_encode(pk, SUBJECT))));
-    r.insert("ce_time".into(), OutValue::Ts(ctx.capture_ms * 1000));
-    r.insert("ce_datacontenttype".into(), s("application/json"));
-    r.insert("ce_dataschema".into(), s(&format!("urn:cdcell:schema:{}:{}:{}:{}", ctx.script, ctx.class, table, ctx.schema_version)));
-    r.insert("ce_sequence".into(), s(&format!("{:020}{:020}{:010}", ctx.epoch, ctx.txid, total)));
-    r.insert("ce_partitionkey".into(), s(&format!("{}/{}/{}", ctx.script, ctx.class, ctx.cell)));
-    r.insert("ce_recordedtime".into(), OutValue::Ts(ctx.now_us));
-    r.insert("_cell_id".into(), s(ctx.cell));
-    r.insert("_epoch".into(), OutValue::Long(ctx.epoch as i64));
-    r.insert("_txid".into(), OutValue::Long(ctx.txid as i64));
-    r.insert("_key_json".into(), s(pk));
-    r.insert("op".into(), s(op));
-    let mut src = BTreeMap::new();
-    src.insert("version".into(), s(CONNECTOR_VERSION));
-    src.insert("connector".into(), s("cdcell"));
-    src.insert("name".into(), s(ctx.script));
-    src.insert("ts_ms".into(), OutValue::Long(ctx.capture_ms));
-    src.insert("ts_us".into(), OutValue::Long(ctx.capture_ms * 1000));
-    src.insert("snapshot".into(), s(snapshot));
-    src.insert("db".into(), s(ctx.cell));
-    src.insert("sequence".into(), s(&format!("[\"{}:{}\"]", ctx.epoch, ctx.txid)));
-    src.insert("table".into(), s(table));
-    src.insert("change_id".into(), OutValue::Long(ctx.txid as i64));
-    src.insert("script".into(), s(ctx.script));
-    src.insert("cell_class".into(), s(ctx.class));
-    src.insert("cell_id".into(), s(ctx.cell));
-    src.insert("epoch".into(), OutValue::Long(ctx.epoch as i64));
-    src.insert("txid".into(), OutValue::Long(ctx.txid as i64));
-    src.insert("synthetic".into(), OutValue::Bool(matches!(ctx.kind, Kind::Synthetic)));
-    r.insert("source".into(), OutValue::Struct(src));
-    let mut tx = BTreeMap::new();
-    tx.insert("id".into(), s(&format!("{}:{}", ctx.epoch, ctx.txid)));
-    tx.insert("total_order".into(), OutValue::Long(total));
-    tx.insert("data_collection_order".into(), OutValue::Long(dco));
-    r.insert("transaction".into(), OutValue::Struct(tx));
-    r.insert("ts_ms".into(), OutValue::Long(ctx.now_us / 1000));
-    r.insert("ts_us".into(), OutValue::Long(ctx.now_us));
+    r.insert("__cell_id".into(), OutValue::Str(ctx.cell.to_string()));
+    r.insert("__epoch".into(), OutValue::Long(ctx.epoch as i64));
+    r.insert("__txid".into(), OutValue::Long(ctx.txid as i64));
+    r.insert("__op".into(), OutValue::Str(op.to_string()));
+    r.insert("__key".into(), OutValue::Str(pk.to_string()));
+    r.insert("__ts".into(), OutValue::Ts(ctx.capture_ms * 1000));
+    r.insert("__ingested_at".into(), OutValue::Ts(ctx.now_us));
     r
 }
 
-fn op_and_snapshot(ctx: &Ctx<'_>, c: &RowChange, i: usize, n: usize) -> (&'static str, &'static str) {
+fn op_code(ctx: &Ctx<'_>, c: &RowChange) -> &'static str {
     match ctx.kind {
-        Kind::Bootstrap { first, last } => ("r", if first && i == 0 { "first" } else if last && i + 1 == n { "last" } else { "true" }),
-        _ => (c.op.code(), "false"),
+        Kind::Bootstrap => "r",
+        _ => c.op.code(),
     }
 }
 
-/// Builds the output rows for one unit. `changes` are the unit's row changes
-/// in the decoder's (table, pk_json) order, which fixes
-/// `transaction.total_order`.
+/// Change-log rows for one unit's changes to ordinary tables.
 pub fn rows(ctx: &Ctx<'_>, infos: &dyn Fn(&str) -> Option<TableInfo>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
     let mut out = Vec::with_capacity(changes.len());
-    let mut per_table: BTreeMap<&str, i64> = BTreeMap::new();
-    let n = changes.len();
-    for (i, c) in changes.iter().enumerate() {
+    for c in changes {
         let Some(info) = infos(&c.table) else { continue };
-        let dco = {
-            let e = per_table.entry(c.table.as_str()).or_default();
-            *e += 1;
-            *e
-        };
         let pk = key_json(&c.key);
-        let (op, snapshot) = op_and_snapshot(ctx, c, i, n);
-        let mut r = base(ctx, &c.table, &pk, op, snapshot, i as i64 + 1, dco);
+        let mut r = meta(ctx, op_code(ctx, c), &pk);
+        r.insert(FINGERPRINT.into(), OutValue::Str(fingerprint(&info)));
         let mut raw = Vec::new();
-        if let Some(b) = c.before.as_ref() {
-            r.insert("before".into(), image(&info, b, &mut raw, c.after.is_none()));
-        }
-        if let Some(a) = c.after.as_ref() {
-            r.insert("after".into(), image(&info, a, &mut raw, true));
+        let (image, key_only) = match (c.op, &c.after, &c.before) {
+            (Op::Delete, _, Some(b)) => (b, true),
+            (_, Some(a), _) => (a, false),
+            _ => continue,
+        };
+        for (name, v) in image {
+            let Some((idx, col)) = info.columns.iter().enumerate().find(|(_, col)| &col.name == name) else { continue };
+            if key_only && !info.pk.contains(&idx) {
+                continue; // deletes carry only the key
+            }
+            match typed(v, col.affinity) {
+                Some(t) => {
+                    r.insert(out_col(name), t);
+                }
+                None => raw.push((out_col(name), v.to_json())),
+            }
         }
         if !raw.is_empty() {
-            r.insert("_raw".into(), OutValue::Map(raw));
+            r.insert("__raw".into(), OutValue::Map(raw));
         }
-        r.insert("_key".into(), key_struct(&info, &c.key));
         out.push((c.table.clone(), r));
     }
     out
 }
 
+/// A delete row built from a change-log key (resync, design §6): meta,
+/// fingerprint and the key columns that can be typed.
+pub fn delete_row(ctx: &Ctx<'_>, key: &str, fingerprint: &str, cols: Vec<(String, OutValue)>) -> OutRow {
+    let mut r = meta(ctx, "d", key);
+    r.insert(FINGERPRINT.into(), OutValue::Str(fingerprint.to_string()));
+    for (c, v) in cols {
+        r.insert(c, v);
+    }
+    r
+}
+
 /// The KV table (design §8.7).
 pub const KV_TABLE: &str = "_cdcell_kv";
 
-fn kv_image(row: &[(String, Value)]) -> OutValue {
-    let v = row.iter().find(|(n, _)| n == "v").map(|(_, v)| v.clone()).unwrap_or(Value::Null);
-    let d = cdcell_core::kv::decode(&v);
-    let mut m = BTreeMap::new();
-    m.insert("value_type".into(), OutValue::Str(d.value_type.as_str().into()));
-    m.insert("value_json".into(), d.value_json.map_or(OutValue::Null, OutValue::Str));
-    m.insert("value_raw".into(), OutValue::Bin(d.value_raw));
-    OutValue::Struct(m)
-}
-
-/// `_cf_KV` changes → `_cdcell_kv` rows, keyed by `k` (one scope per DB).
+/// `_cf_KV` changes → `_cdcell_kv` rows keyed by `k` (one scope per DB):
+/// columns `k`, `value_type`, `value_json`, `value_raw`.
 pub fn kv_rows(ctx: &Ctx<'_>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
-    let n = changes.len();
-    let mut out = Vec::with_capacity(n);
-    for (i, c) in changes.iter().enumerate() {
+    let mut out = Vec::with_capacity(changes.len());
+    for c in changes {
         let k = match c.key.last() {
             Some(Value::Text(k)) => k.clone(),
             _ => continue,
         };
         let pk = key_json(&[Value::Text(k.clone())]);
-        let (op, snapshot) = op_and_snapshot(ctx, c, i, n);
-        let mut r = base(ctx, KV_TABLE, &pk, op, snapshot, i as i64 + 1, i as i64 + 1);
-        let mut key = BTreeMap::new();
-        key.insert("k".to_string(), OutValue::Str(k));
-        r.insert("_key".into(), OutValue::Struct(key));
-        if let Some(b) = c.before.as_ref() {
-            r.insert("before".into(), kv_image(b));
-        }
-        if let Some(a) = c.after.as_ref() {
-            r.insert("after".into(), kv_image(a));
+        let mut r = meta(ctx, op_code(ctx, c), &pk);
+        r.insert(FINGERPRINT.into(), OutValue::Str("kv-v1".into()));
+        r.insert("k".into(), OutValue::Str(k));
+        if c.op != Op::Delete {
+            if let Some(a) = &c.after {
+                let v = a.iter().find(|(n, _)| n == "v").map(|(_, v)| v.clone()).unwrap_or(Value::Null);
+                let d = cdcell_core::kv::decode(&v);
+                r.insert("value_type".into(), OutValue::Str(d.value_type.as_str().into()));
+                r.insert("value_json".into(), d.value_json.map_or(OutValue::Null, OutValue::Str));
+                r.insert("value_raw".into(), OutValue::Bin(d.value_raw));
+            }
         }
         out.push((KV_TABLE.to_string(), r));
     }
     out
-}
-
-/// Placeholder table info for the KV table's batch entry.
-pub fn kv_info() -> TableInfo {
-    TableInfo {
-        name: KV_TABLE.into(),
-        root: 0,
-        sql: String::new(),
-        without_rowid: false,
-        columns: Vec::new(),
-        record_order: Vec::new(),
-        rowid_alias: None,
-        pk: Vec::new(),
-    }
 }
 
 #[cfg(test)]
@@ -256,13 +188,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_formats() {
-        assert_eq!(ce_source("shop", "Shop", "Shop:abc"), "/cdcell/sqlite/shop/Shop/Shop:abc");
-        let id = ce_id(Kind::Streamed, 9, 4182, "orders", "[42]");
-        assert!(id.starts_with("9:4182:orders:") && id.len() == "9:4182:orders:".len() + 16);
-        assert!(ce_id(Kind::Synthetic, 1, 1, "t", "[1]").starts_with("s:"));
+    fn typing_and_names() {
         assert_eq!(typed(&Value::Integer(5), Affinity::Real), Some(OutValue::Double(5.0)));
         assert_eq!(typed(&Value::Text("x".into()), Affinity::Integer), None);
         assert_eq!(typed(&Value::Integer(5), Affinity::Untyped), Some(OutValue::Str("5".into())));
+        assert_eq!(out_col("__op"), "u__op");
+        assert_eq!(out_col("note"), "note");
     }
 }

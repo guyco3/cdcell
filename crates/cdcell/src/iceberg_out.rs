@@ -14,7 +14,7 @@ use arrow_array::builder::*;
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use iceberg::spec::{
-    Datum, Literal, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, StructType, Transform, Type,
+    Datum, Literal, MapType, NestedField, PartitionSpec, PrimitiveType, Schema, Struct, Transform, Type,
     UnboundPartitionSpec,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -74,123 +74,57 @@ fn prim(p: PrimitiveType) -> Type {
     Type::Primitive(p)
 }
 
-fn row_struct(ids: &mut Ids, info: &TableInfo) -> Type {
-    Type::Struct(StructType::new(info.columns.iter().map(|c| opt(ids, &c.name, prim(column_type(c.affinity)))).collect()))
-}
-
-fn key_struct(ids: &mut Ids, info: &TableInfo) -> Type {
-    if info.pk.is_empty() {
-        Type::Struct(StructType::new(vec![opt(ids, "rowid", prim(PrimitiveType::Long))]))
-    } else {
-        Type::Struct(StructType::new(
-            info.pk.iter().map(|&c| opt(ids, &info.columns[c].name, prim(column_type(info.columns[c].affinity)))).collect(),
-        ))
-    }
-}
-
-/// The frozen v1 change-table schema (design §8.2) for one SQLite table.
-pub fn change_schema(info: &TableInfo) -> Result<Schema> {
+/// Meta columns of every change-log table (design rev 5).
+fn meta_fields(i: &mut Ids) -> Vec<Arc<NestedField>> {
     use PrimitiveType::*;
+    vec![
+        req(i, "__cell_id", prim(String)),
+        req(i, "__epoch", prim(Long)),
+        req(i, "__txid", prim(Long)),
+        req(i, "__op", prim(String)),
+        req(i, "__key", prim(String)),
+        req(i, "__ts", prim(Timestamptz)),
+        req(i, "__schema_version", prim(Long)),
+        req(i, "__ingested_at", prim(Timestamptz)),
+    ]
+}
+
+fn raw_field(i: &mut Ids) -> Arc<NestedField> {
+    let (kid, vid) = (i.next(), i.next());
+    opt(
+        i,
+        "__raw",
+        Type::Map(MapType::new(
+            Arc::new(NestedField::map_key_element(kid, prim(PrimitiveType::String))),
+            Arc::new(NestedField::map_value_element(vid, prim(PrimitiveType::String), false)),
+        )),
+    )
+}
+
+/// The change-log schema for one SQLite table: meta columns, the table's
+/// columns (typed by affinity, all nullable), `__raw`.
+pub fn change_schema(info: &TableInfo) -> Result<Schema> {
     let mut ids = Ids(0);
     let i = &mut ids;
-    let mut fields = vec![
-        req(i, "ce_id", prim(String)),
-        req(i, "ce_source", prim(String)),
-        req(i, "ce_specversion", prim(String)),
-        req(i, "ce_type", prim(String)),
-        req(i, "ce_subject", prim(String)),
-        req(i, "ce_time", prim(Timestamptz)),
-        req(i, "ce_datacontenttype", prim(String)),
-        req(i, "ce_dataschema", prim(String)),
-        req(i, "ce_sequence", prim(String)),
-        req(i, "ce_partitionkey", prim(String)),
-        req(i, "ce_recordedtime", prim(Timestamptz)),
-        req(i, "_cell_id", prim(String)),
-        req(i, "_epoch", prim(Long)),
-        req(i, "_txid", prim(Long)),
-        req(i, "_key_json", prim(String)),
-    ];
-    let k = key_struct(i, info);
-    fields.push(opt(i, "_key", k));
-    let k = key_struct(i, info);
-    fields.push(opt(i, "_old_key", k));
-    let k = key_struct(i, info);
-    fields.push(opt(i, "_new_key", k));
-    fields.push(req(i, "op", prim(String)));
-    let b = row_struct(i, info);
-    fields.push(opt(i, "before", b));
-    let a = row_struct(i, info);
-    fields.push(opt(i, "after", a));
-    let (kid, vid) = (i.next(), i.next());
-    fields.push(opt(
-        i,
-        "_raw",
-        Type::Map(MapType::new(
-            Arc::new(NestedField::map_key_element(kid, prim(String))),
-            Arc::new(NestedField::map_value_element(vid, prim(String), false)),
-        )),
-    ));
-    let source = StructType::new(vec![
-        opt(i, "version", prim(String)),
-        opt(i, "connector", prim(String)),
-        opt(i, "name", prim(String)),
-        opt(i, "ts_ms", prim(Long)),
-        opt(i, "ts_us", prim(Long)),
-        opt(i, "snapshot", prim(String)),
-        opt(i, "db", prim(String)),
-        opt(i, "sequence", prim(String)),
-        opt(i, "table", prim(String)),
-        opt(i, "change_id", prim(Long)),
-        opt(i, "script", prim(String)),
-        opt(i, "cell_class", prim(String)),
-        opt(i, "cell_id", prim(String)),
-        opt(i, "epoch", prim(Long)),
-        opt(i, "txid", prim(Long)),
-        opt(i, "synthetic", prim(Boolean)),
-    ]);
-    fields.push(opt(i, "source", Type::Struct(source)));
-    let tx = StructType::new(vec![opt(i, "id", prim(String)), opt(i, "total_order", prim(Long)), opt(i, "data_collection_order", prim(Long))]);
-    fields.push(opt(i, "transaction", Type::Struct(tx)));
-    fields.push(req(i, "ts_ms", prim(Long)));
-    fields.push(req(i, "ts_us", prim(Long)));
+    let mut fields = meta_fields(i);
+    for c in &info.columns {
+        fields.push(opt(i, &crate::emit::out_col(&c.name), prim(column_type(c.affinity))));
+    }
+    fields.push(raw_field(i));
     Schema::builder().with_fields(fields).build().context("change schema")
 }
 
-/// `_cdcell_kv` (design §8.7): the change-table envelope with
-/// `_key struct<k>` and value images `struct<value_type, value_json, value_raw>`.
+/// `_cdcell_kv` (design §8.7): meta columns, `k`, `value_type`,
+/// `value_json`, `value_raw`.
 pub fn kv_schema() -> Result<Schema> {
-    let base = change_schema(&TableInfo {
-        name: "_cdcell_kv".into(),
-        root: 0,
-        sql: String::new(),
-        without_rowid: true,
-        columns: vec![cdcell_core::schema::Column {
-            name: "k".into(),
-            decl_type: "TEXT".into(),
-            affinity: Affinity::Text,
-            not_null: true,
-            default: cdcell_core::Value::Null,
-            generated: None,
-        }],
-        record_order: vec![0],
-        rowid_alias: None,
-        pk: vec![0],
-    })?;
-    // Replace before/after with the value image struct.
-    let mut ids = Ids(base.highest_field_id());
-    let mut fields: Vec<Arc<NestedField>> = Vec::new();
-    for f in base.as_struct().fields() {
-        if f.name == "before" || f.name == "after" {
-            let image = Type::Struct(StructType::new(vec![
-                opt(&mut ids, "value_type", prim(PrimitiveType::String)),
-                opt(&mut ids, "value_json", prim(PrimitiveType::String)),
-                opt(&mut ids, "value_raw", prim(PrimitiveType::Binary)),
-            ]));
-            fields.push(Arc::new(NestedField::optional(f.id, &f.name, image)));
-        } else {
-            fields.push(f.clone());
-        }
-    }
+    use PrimitiveType::*;
+    let mut ids = Ids(0);
+    let i = &mut ids;
+    let mut fields = meta_fields(i);
+    fields.push(opt(i, "k", prim(String)));
+    fields.push(opt(i, "value_type", prim(String)));
+    fields.push(opt(i, "value_json", prim(String)));
+    fields.push(opt(i, "value_raw", prim(Binary)));
     Schema::builder().with_fields(fields).build().context("kv schema")
 }
 
@@ -220,6 +154,10 @@ pub fn ident(name: &str) -> String {
         s
     }
 }
+
+/// Table properties cdcell maintains on its tables (design §11.3).
+pub const TABLE_PROPERTIES: [(&str, &str); 2] =
+    [("write.metadata.delete-after-commit.enabled", "true"), ("write.metadata.previous-versions-max", "100")];
 
 pub struct Sink {
     catalog: Arc<dyn Catalog>,
@@ -268,16 +206,20 @@ impl Sink {
         self.ensure_namespace(ns).await?;
         let ident = TableIdent::new(NamespaceIdent::from_vec(ns.to_vec())?, name.to_string());
         if self.catalog.table_exists(&ident).await? {
+            self.ensure_properties(&ident).await?;
             return Ok(ident);
         }
         let mut builder = UnboundPartitionSpec::builder();
-        if let (Some(t), Some(c)) = (schema.field_by_name("ce_time"), schema.field_by_name("_cell_id")) {
+        if let (Some(t), Some(c)) = (schema.field_by_name("__ts"), schema.field_by_name("__cell_id")) {
             builder = builder
-                .add_partition_field(t.id, "ce_time_day", Transform::Day)?
+                .add_partition_field(t.id, "ts_day", Transform::Day)?
                 .add_partition_field(c.id, "cell_bucket", Transform::Bucket(16))?;
         }
         let mut properties = props;
         properties.insert("format-version".into(), "2".into());
+        for (k, v) in TABLE_PROPERTIES {
+            properties.insert(k.to_string(), v.to_string());
+        }
         let creation = TableCreation::builder().name(name.to_string()).schema(schema).partition_spec(builder.build()).properties(properties).build();
         match self.catalog.create_table(&ident.namespace, creation).await {
             Ok(_) => Ok(ident),
@@ -399,8 +341,166 @@ impl Sink {
         Ok(found)
     }
 
+    /// Sets missing maintenance properties on an existing table.
+    async fn ensure_properties(&self, ident: &TableIdent) -> Result<()> {
+        let table = self.catalog.load_table(ident).await?;
+        let props = table.metadata().properties();
+        let missing: Vec<_> = TABLE_PROPERTIES.iter().filter(|(k, v)| props.get(*k).map(String::as_str) != Some(*v)).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let tx = Transaction::new(&table);
+        let mut action = tx.update_table_properties();
+        for (k, v) in missing {
+            action = action.set(k.to_string(), v.to_string());
+        }
+        action.apply(tx)?.commit(self.catalog.as_ref()).await?;
+        Ok(())
+    }
+
+    /// Schema evolution for one change-log table before a commit (design
+    /// rev 5): maps each row's fingerprint to `__schema_version` through the
+    /// registry (`cdcell.schemas` table property, fingerprint → version),
+    /// adds missing columns, and moves values whose type conflicts with an
+    /// existing column into `<col>__<type>`. Schema and registry are
+    /// committed (additive, so readers never break) before the data.
+    pub async fn evolve(&self, ident: &TableIdent, rows: &mut [OutRow]) -> Result<()> {
+        let table = self.catalog.load_table(ident).await?;
+        let schema = table.metadata().current_schema().clone();
+        let mut registry: BTreeMap<String, i64> = table
+            .metadata()
+            .properties()
+            .get("cdcell.schemas")
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let before = registry.clone();
+        let mut add: BTreeMap<String, PrimitiveType> = BTreeMap::new();
+        for row in rows.iter_mut() {
+            if let Some(OutValue::Str(fp)) = row.remove(crate::emit::FINGERPRINT) {
+                let next = registry.values().max().copied().unwrap_or(0) + 1;
+                let v = *registry.entry(fp).or_insert(next);
+                row.insert("__schema_version".into(), OutValue::Long(v));
+            }
+            let names: Vec<String> = row.keys().filter(|k| !k.starts_with("__")).cloned().collect();
+            for name in names {
+                let Some(want) = value_type(&row[&name]) else { continue };
+                let existing = schema.field_by_name(&name).map(|f| (*f.field_type).clone());
+                match existing {
+                    None => {
+                        add.entry(name).or_insert(want);
+                    }
+                    Some(Type::Primitive(p)) if p == want => {}
+                    Some(_) => {
+                        let alt = format!("{name}__{}", type_suffix(&want));
+                        let v = row.remove(&name).unwrap();
+                        row.insert(alt.clone(), v);
+                        if schema.field_by_name(&alt).is_none() {
+                            add.entry(alt).or_insert(want);
+                        }
+                    }
+                }
+            }
+        }
+        if add.is_empty() && registry == before {
+            return Ok(());
+        }
+        let tx = Transaction::new(&table);
+        let mut tx = tx;
+        if !add.is_empty() {
+            let mut us = tx.update_schema();
+            for (name, t) in &add {
+                us = us.add_column(iceberg::transaction::AddColumn::optional(name, Type::Primitive(t.clone())));
+            }
+            tx = us.apply(tx)?;
+        }
+        if registry != before {
+            tx = tx.update_table_properties().set("cdcell.schemas".into(), serde_json::to_string(&registry)?).apply(tx)?;
+        }
+        tx.commit(self.catalog.as_ref()).await?;
+        Ok(())
+    }
+
+    /// Every table under a namespace prefix (recursive).
+    /// Keys of `cell` whose latest change-log row is not a delete (resync,
+    /// design §6). Empty when the table does not exist yet.
+    pub async fn live_keys(&self, ns: &[String], name: &str, cell: &str) -> Result<std::collections::BTreeSet<String>> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use futures::TryStreamExt;
+        let ident = TableIdent::new(NamespaceIdent::from_vec(ns.to_vec())?, name.to_string());
+        if !self.catalog.table_exists(&ident).await? {
+            return Ok(Default::default());
+        }
+        let table = self.catalog.load_table(&ident).await?;
+        if table.metadata().current_snapshot().is_none() {
+            return Ok(Default::default());
+        }
+        let pred = iceberg::expr::Reference::new("__cell_id").equal_to(iceberg::spec::Datum::string(cell));
+        let stream = table.scan().select(["__cell_id", "__key", "__op", "__epoch", "__txid"]).with_filter(pred).build()?.to_arrow().await?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut rows = Vec::new();
+        for b in &batches {
+            let col = |n: &str| b.column_by_name(n).ok_or_else(|| anyhow!("scan of {name}: no column {n}"));
+            let (c, k, o) = (col("__cell_id")?.as_string::<i32>(), col("__key")?.as_string::<i32>(), col("__op")?.as_string::<i32>());
+            let (e, t) = (col("__epoch")?.as_primitive::<Int64Type>(), col("__txid")?.as_primitive::<Int64Type>());
+            for i in 0..b.num_rows() {
+                if c.value(i) == cell {
+                    rows.push((k.value(i).to_string(), o.value(i).to_string(), e.value(i), t.value(i)));
+                }
+            }
+        }
+        Ok(crate::resync::live_keys(rows))
+    }
+
+    pub async fn tables_under(&self, root: &[String]) -> Result<Vec<TableIdent>> {
+        let mut out = Vec::new();
+        let mut stack = vec![NamespaceIdent::from_vec(root.to_vec())?];
+        while let Some(ns) = stack.pop() {
+            if !self.catalog.namespace_exists(&ns).await? {
+                continue;
+            }
+            out.extend(self.catalog.list_tables(&ns).await?);
+            stack.extend(self.catalog.list_namespaces(Some(&ns)).await?);
+        }
+        Ok(out)
+    }
+
+    /// Expires snapshots older than `older_than_ms` beyond the newest
+    /// `retain_last`, and sets the maintenance properties (design §11.3).
+    pub async fn maintain(&self, ident: &TableIdent, retain_last: usize, older_than_ms: i64) -> Result<(usize, usize)> {
+        self.ensure_properties(ident).await?;
+        let table = self.catalog.load_table(ident).await?;
+        let before = table.metadata().snapshots().count();
+        let tx = Transaction::new(&table);
+        let action = tx.expire_snapshots().retain_last(retain_last).expire_older_than_ms(older_than_ms);
+        let table = action.apply(tx)?.commit(self.catalog.as_ref()).await?;
+        Ok((before, table.metadata().snapshots().count()))
+    }
+
     pub fn table_ident(ns: &[String], name: &str) -> Result<TableIdent> {
         Ok(TableIdent::new(NamespaceIdent::from_vec(ns.to_vec())?, name.to_string()))
+    }
+}
+
+fn value_type(v: &OutValue) -> Option<PrimitiveType> {
+    Some(match v {
+        OutValue::Long(_) => PrimitiveType::Long,
+        OutValue::Double(_) => PrimitiveType::Double,
+        OutValue::Str(_) => PrimitiveType::String,
+        OutValue::Bin(_) => PrimitiveType::Binary,
+        OutValue::Bool(_) => PrimitiveType::Boolean,
+        OutValue::Ts(_) => PrimitiveType::Timestamptz,
+        OutValue::Null | OutValue::Struct(_) | OutValue::Map(_) => return None,
+    })
+}
+
+fn type_suffix(t: &PrimitiveType) -> &'static str {
+    match t {
+        PrimitiveType::Long => "long",
+        PrimitiveType::Double => "double",
+        PrimitiveType::String => "string",
+        PrimitiveType::Binary => "binary",
+        _ => "value",
     }
 }
 

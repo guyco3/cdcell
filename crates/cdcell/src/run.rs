@@ -91,8 +91,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     let state = Store::s3(&cfg.state_endpoint, &cfg.state_bucket, &cfg.state_prefix, &cfg.state_key, &cfg.state_secret)?;
     let script = script_name(&cfg, &src).await?;
     let sink = crate::iceberg_out::Sink::connect(&cfg.catalog, &cfg.warehouse).await?;
-    let mut pipe = Pipeline::new(src.clone(), state, sink, Settings { script: script.clone(), ce_type_prefix: "dev".into(), gap_timeout: cfg.gap_timeout });
+    let mut pipe = Pipeline::new(src.clone(), state, sink, Settings { script: script.clone(), gap_timeout: cfg.gap_timeout });
 
+    crate::metrics::serve(&std::env::var("CDCELL_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9464".into())).await?;
     pipe.acquire_lease(Duration::from_secs(30)).await?;
     pipe.recover().await?;
     let drop_pct: u64 = std::env::var("CDCELL_TEST_DROP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -124,6 +125,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     loop {
         // 1. intake: up to 500 messages or 1 s
         let mut batch = consumer.fetch().max_messages(500).expires(Duration::from_secs(1)).messages().await?;
+        // Collect the batch, then GET + decode its objects concurrently:
+        // bundles are GC'd ~30-40 s after coverage, so intake must keep up
+        // (design §4.3). Units are added in message order afterwards.
+        let mut fetched: Vec<(MsgId, Vec<(String, ObjKey)>)> = Vec::new();
         while let Some(msg) = batch.next().await {
             let msg = match msg {
                 Ok(m) => m,
@@ -134,51 +139,79 @@ pub async fn run(cfg: Config) -> Result<()> {
             };
             next_id += 1;
             let id = next_id;
-            let mut units = Vec::new();
-            // Test knob (M5 gate): lose N% of notifications.
-            if drop_pct > 0 && (id.wrapping_mul(2654435761) % 100) < drop_pct {
-                pipe.track(id, 0);
-                held.insert(id, msg);
-                continue;
-            }
-            for key in keys_of(&msg.payload, &cfg.source_prefix) {
-                let parsed = keys::parse(&key);
-                let got_at = Instant::now();
-                match parsed {
-                    ObjKey::Ltx { cell, epoch, level: 0, .. } => {
-                        if let Some(body) = src.get(&key).await? {
-                            match cdcell_core::ltx::decode_file(&body) {
-                                Ok(unit) => units.push(UnitIn { cell, epoch, unit, origin: Origin::Cell, msg: Some(id), got_at }),
-                                Err(e) => warn!(key, %e, "undecodable LTX object"),
+            // Test knob: lose N% of notifications.
+            let keys = if drop_pct > 0 && (id.wrapping_mul(2654435761) % 100) < drop_pct {
+                Vec::new()
+            } else {
+                keys_of(&msg.payload, &cfg.source_prefix)
+                    .into_iter()
+                    .map(|k| {
+                        let p = keys::parse(&k);
+                        (k, p)
+                    })
+                    .filter(|(k, p)| match p {
+                        ObjKey::Ltx { level: 0, .. } => true,
+                        ObjKey::Bundle { .. } => pipe.mark_bundle(k), // false: already read by reconciliation
+                        _ => false, // own.json, L1/L9, recovery hints: no unit
+                    })
+                    .collect()
+            };
+            fetched.push((id, keys));
+            held.insert(id, msg);
+        }
+        let jobs = fetched.iter().flat_map(|(id, keys)| keys.iter().map(move |(k, p)| (*id, k.clone(), p.clone())));
+        let mut results: Vec<(MsgId, Vec<UnitIn>)> = futures::stream::iter(jobs)
+            .map(|(id, key, parsed)| {
+                let src = src.clone();
+                async move {
+                    let got_at = Instant::now();
+                    let body = src.get(&key).await?;
+                    let mut units = Vec::new();
+                    let Some(body) = body else { return anyhow::Ok((id, units)) };
+                    match parsed {
+                        ObjKey::Ltx { cell, epoch, .. } => match cdcell_core::ltx::decode_file(&body) {
+                            Ok(unit) => units.push(UnitIn { cell, epoch, unit, origin: Origin::Cell, msg: Some(id), got_at, bootstrap: false }),
+                            Err(e) => {
+                                crate::metrics::inc(&crate::metrics::M.decode_errors);
+                                warn!(key, %e, "undecodable LTX object")
                             }
-                        }
-                    }
-                    ObjKey::Bundle { node, generation, log_epoch, .. } => {
-                        if !pipe.mark_bundle(&key) {
-                            continue; // already read by reconciliation
-                        }
-                        if let Some(body) = src.get(&key).await? {
-                            match cdcell_core::ltx::decode_bundle(&body) {
-                                Ok(rows) => units.extend(rows.into_iter().map(|r| UnitIn {
-                                    cell: r.cell,
-                                    epoch: r.cell_epoch,
-                                    unit: r.unit,
-                                    origin: Origin::Bundle { node: node.clone(), generation: generation.clone(), log_epoch },
-                                    msg: Some(id),
-                                    got_at,
-                                })),
-                                Err(e) => warn!(key, %e, "undecodable bundle"),
+                        },
+                        ObjKey::Bundle { node, generation, log_epoch, .. } => match cdcell_core::ltx::decode_bundle(&body) {
+                            Ok(rows) => units.extend(rows.into_iter().map(|r| UnitIn {
+                                cell: r.cell,
+                                epoch: r.cell_epoch,
+                                unit: r.unit,
+                                origin: Origin::Bundle { node: node.clone(), generation: generation.clone(), log_epoch },
+                                msg: Some(id),
+                                got_at,
+                                bootstrap: false,
+                            })),
+                            Err(e) => {
+                                crate::metrics::inc(&crate::metrics::M.decode_errors);
+                                warn!(key, %e, "undecodable bundle")
                             }
-                        }
+                        },
+                        _ => {}
                     }
-                    _ => {} // own.json, L1/L9, recovery hints: no unit (v1 M2)
+                    anyhow::Ok((id, units))
                 }
-            }
-            pipe.track(id, units.len());
+            })
+            .buffer_unordered(32)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_>>()?;
+        results.sort_by_key(|(id, _)| *id);
+        let mut per_msg: HashMap<MsgId, Vec<UnitIn>> = HashMap::new();
+        for (id, units) in results {
+            per_msg.entry(id).or_default().extend(units);
+        }
+        for (id, _) in &fetched {
+            let units = per_msg.remove(id).unwrap_or_default();
+            pipe.track(*id, units.len());
             for u in units {
                 pipe.add(u);
             }
-            held.insert(id, msg);
         }
         // 2. confirm + apply; periodic tail reconciliation and lease renewal
         if last_reconcile.elapsed() >= reconcile_every {

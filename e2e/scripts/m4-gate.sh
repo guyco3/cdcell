@@ -17,8 +17,10 @@ settle() { for _ in $(seq 1 40); do n=$(python3 -I tools/inspect.py leases | gre
 docker compose start celld-a celld-b celld-c >/dev/null
 settle
 nats consumer rm CELLD cdcell -f >/dev/null 2>&1 || true
+# clean, constant starting state: empty celld fleet, stream, cdcell state, output
+( source tests/lib.sh; fresh )
 docker rm -f cdcell-run >/dev/null 2>&1 || true
-docker run -d --name cdcell-run --network "$NET" -v cdcell-target:/t \
+docker run -d --name cdcell-run --network "$NET" -p 9464:9464 -v cdcell-target:/t \
   -e RUST_LOG=info,iceberg=warn -e CDCELL_COMMIT_INTERVAL_S=10 -e CDCELL_GAP_TIMEOUT_S=15 \
   celld-cdc/rust-dev:1.98.1 /t/debug/cdcell run >/dev/null
 sleep 5
@@ -38,6 +40,6 @@ done
 
 echo "== final write to every shop (new epochs emit their openers)"
 ./scripts/load.sh 40 4 10
-sleep 45
+( source tests/lib.sh; wait_caught_up )
 docker logs cdcell-run 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "committed batch|paged|WARN|ERROR" | tail -4 | cut -c1-280
 python3 -I tools/verify_type1.py --shops $(seq -f "$SHOP_PREFIX-%02g" 1 10) && echo "M4: PASS"
