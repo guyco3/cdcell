@@ -57,8 +57,8 @@ Details, deviations from the design, and open items:
 
 The Rust workspace depends on celld's `celld-ltx` crate by path
 (`../celld/crates/ltx`), so check out celld next to this repo. Builds run in a
-container (`scripts/cargo.sh`, image `celld-cdc/rust-dev:1.98.1`, built from
-the celld repo's Dockerfile `build` stage):
+container (`scripts/cargo.sh`: celld's Rust version plus clippy/rustfmt,
+`scripts/rust-dev.Dockerfile`, built automatically on first use):
 
 ```sh
 scripts/cargo.sh build -p cdcell

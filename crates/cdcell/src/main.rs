@@ -1,14 +1,6 @@
 //! cdcell: CDC from celld Durable Objects to Iceberg.
 
-mod capture;
-mod emit;
-mod iceberg_out;
-mod keys;
-mod metrics;
-mod pipeline;
-mod resync;
-mod run;
-mod source;
+use cdcell::{emit, iceberg_out, run};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

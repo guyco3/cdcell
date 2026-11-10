@@ -136,7 +136,7 @@ another volume, and point the test at it:
 ```sh
 git worktree add ../cdcell-old <commit>
 docker run --rm -v ~/dev:/work -w /work/cdcell-old -v cdcell-cargo-registry:/usr/local/cargo/registry \
-  -v cdcell-old-target:/work/cdcell-old/target celld-cdc/rust-dev:1.98.1 cargo build -p cdcell
+  -v cdcell-old-target:/work/cdcell-old/target cdcell/rust-dev:1.98.1 cargo build -p cdcell
 TARGET_VOL=cdcell-old-target ./scripts/m5-gate.sh lost     # expect FAIL
 ```
 
