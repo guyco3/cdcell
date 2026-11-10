@@ -69,7 +69,11 @@ pub(crate) fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -89,7 +93,10 @@ mod tests {
     #[test]
     fn json_forms() {
         assert_eq!(key_json(&[Value::Integer(42)]), "[42]");
-        assert_eq!(key_json(&[Value::Text("a\"b".into()), Value::Null]), "[\"a\\\"b\",null]");
+        assert_eq!(
+            key_json(&[Value::Text("a\"b".into()), Value::Null]),
+            "[\"a\\\"b\",null]"
+        );
         assert_eq!(Value::Blob(b"hi".to_vec()).to_json(), "{\"$b64\":\"aGk=\"}");
         assert_eq!(Value::Real(1.5).to_json(), "1.5");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");

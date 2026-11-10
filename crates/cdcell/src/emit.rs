@@ -1,7 +1,7 @@
-//! Row changes → change-log rows (design rev 5 contract, §8).
+//! Row changes → change-log rows (design §2).
 //!
-//! One append-only table per (script, class, SQLite table). Meta columns use
-//! Debezium's flattened-record convention (double underscore):
+//! One append-only table per (script, class, SQLite table). Meta columns
+//! (double underscore):
 //!
 //! | column | meaning |
 //! |---|---|
@@ -34,7 +34,7 @@ pub const FINGERPRINT: &str = "\u{0}fingerprint";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Streamed,
-    /// Re-emission after a resolution or rebuild (design §5.4, §10).
+    /// Re-emission after a resolution or rebuild (design §4, §5).
     Synthetic,
     /// Initial state of a cell with no committed history.
     Bootstrap,
@@ -65,23 +65,43 @@ pub fn out_col(name: &str) -> String {
 /// different migrations share it.
 pub fn fingerprint(info: &TableInfo) -> String {
     let mut h = Sha256::new();
-    h.update(if info.without_rowid { b"wr;" as &[u8] } else { b"rowid;" });
+    h.update(if info.without_rowid {
+        b"wr;" as &[u8]
+    } else {
+        b"rowid;"
+    });
     for (i, c) in info.columns.iter().enumerate() {
         let pk = info.pk.iter().position(|&p| p == i).map_or(0, |p| p + 1);
-        h.update(format!("{}|{}|{}|{}|{}|{:?};", c.name, c.decl_type.trim().to_ascii_uppercase(), pk, c.not_null, c.default.to_json(), c.generated).as_bytes());
+        h.update(
+            format!(
+                "{}|{}|{}|{}|{}|{:?};",
+                c.name,
+                c.decl_type.trim().to_ascii_uppercase(),
+                pk,
+                c.not_null,
+                c.default.to_json(),
+                c.generated
+            )
+            .as_bytes(),
+        );
     }
-    h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// SQLite value → typed column value, or `None` when it does not fit the
-/// column's affinity (it then goes to `__raw`, design §8.3).
+/// column's affinity (it then goes to `__raw`, design §2).
 fn typed(v: &Value, aff: Affinity) -> Option<OutValue> {
     const EXACT: i64 = 1 << 53;
     Some(match (aff, v) {
         (_, Value::Null) => OutValue::Null,
         (Affinity::Integer, Value::Integer(i)) => OutValue::Long(*i),
         (Affinity::Real | Affinity::Numeric, Value::Real(f)) => OutValue::Double(*f),
-        (Affinity::Real | Affinity::Numeric, Value::Integer(i)) if i.abs() <= EXACT => OutValue::Double(*i as f64),
+        (Affinity::Real | Affinity::Numeric, Value::Integer(i)) if i.abs() <= EXACT => {
+            OutValue::Double(*i as f64)
+        }
         (Affinity::Text, Value::Text(s)) => OutValue::Str(s.clone()),
         (Affinity::Blob, Value::Blob(b)) => OutValue::Bin(b.clone()),
         (Affinity::Untyped, v) => OutValue::Str(v.to_json()),
@@ -109,10 +129,16 @@ fn op_code(ctx: &Ctx<'_>, c: &RowChange) -> &'static str {
 }
 
 /// Change-log rows for one unit's changes to ordinary tables.
-pub fn rows(ctx: &Ctx<'_>, infos: &dyn Fn(&str) -> Option<TableInfo>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
+pub fn rows(
+    ctx: &Ctx<'_>,
+    infos: &dyn Fn(&str) -> Option<TableInfo>,
+    changes: &[RowChange],
+) -> Vec<(String, OutRow)> {
     let mut out = Vec::with_capacity(changes.len());
     for c in changes {
-        let Some(info) = infos(&c.table) else { continue };
+        let Some(info) = infos(&c.table) else {
+            continue;
+        };
         let pk = key_json(&c.key);
         let mut r = meta(ctx, op_code(ctx, c), &pk);
         r.insert(FINGERPRINT.into(), OutValue::Str(fingerprint(&info)));
@@ -123,7 +149,14 @@ pub fn rows(ctx: &Ctx<'_>, infos: &dyn Fn(&str) -> Option<TableInfo>, changes: &
             _ => continue,
         };
         for (name, v) in image {
-            let Some((idx, col)) = info.columns.iter().enumerate().find(|(_, col)| &col.name == name) else { continue };
+            let Some((idx, col)) = info
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| &col.name == name)
+            else {
+                continue;
+            };
             if key_only && !info.pk.contains(&idx) {
                 continue; // deletes carry only the key
             }
@@ -144,7 +177,12 @@ pub fn rows(ctx: &Ctx<'_>, infos: &dyn Fn(&str) -> Option<TableInfo>, changes: &
 
 /// A delete row built from a change-log key (resync, design §6): meta,
 /// fingerprint and the key columns that can be typed.
-pub fn delete_row(ctx: &Ctx<'_>, key: &str, fingerprint: &str, cols: Vec<(String, OutValue)>) -> OutRow {
+pub fn delete_row(
+    ctx: &Ctx<'_>,
+    key: &str,
+    fingerprint: &str,
+    cols: Vec<(String, OutValue)>,
+) -> OutRow {
     let mut r = meta(ctx, "d", key);
     r.insert(FINGERPRINT.into(), OutValue::Str(fingerprint.to_string()));
     for (c, v) in cols {
@@ -153,7 +191,7 @@ pub fn delete_row(ctx: &Ctx<'_>, key: &str, fingerprint: &str, cols: Vec<(String
     r
 }
 
-/// The KV table (design §8.7).
+/// The KV table (design §2).
 pub const KV_TABLE: &str = "_cdcell_kv";
 
 /// `_cf_KV` changes → `_cdcell_kv` rows keyed by `k` (one scope per DB):
@@ -171,10 +209,20 @@ pub fn kv_rows(ctx: &Ctx<'_>, changes: &[RowChange]) -> Vec<(String, OutRow)> {
         r.insert("k".into(), OutValue::Str(k));
         if c.op != Op::Delete {
             if let Some(a) = &c.after {
-                let v = a.iter().find(|(n, _)| n == "v").map(|(_, v)| v.clone()).unwrap_or(Value::Null);
+                let v = a
+                    .iter()
+                    .find(|(n, _)| n == "v")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null);
                 let d = cdcell_core::kv::decode(&v);
-                r.insert("value_type".into(), OutValue::Str(d.value_type.as_str().into()));
-                r.insert("value_json".into(), d.value_json.map_or(OutValue::Null, OutValue::Str));
+                r.insert(
+                    "value_type".into(),
+                    OutValue::Str(d.value_type.as_str().into()),
+                );
+                r.insert(
+                    "value_json".into(),
+                    d.value_json.map_or(OutValue::Null, OutValue::Str),
+                );
                 r.insert("value_raw".into(), OutValue::Bin(d.value_raw));
             }
         }
@@ -189,9 +237,15 @@ mod tests {
 
     #[test]
     fn typing_and_names() {
-        assert_eq!(typed(&Value::Integer(5), Affinity::Real), Some(OutValue::Double(5.0)));
+        assert_eq!(
+            typed(&Value::Integer(5), Affinity::Real),
+            Some(OutValue::Double(5.0))
+        );
         assert_eq!(typed(&Value::Text("x".into()), Affinity::Integer), None);
-        assert_eq!(typed(&Value::Integer(5), Affinity::Untyped), Some(OutValue::Str("5".into())));
+        assert_eq!(
+            typed(&Value::Integer(5), Affinity::Untyped),
+            Some(OutValue::Str("5".into()))
+        );
         assert_eq!(out_col("__op"), "u__op");
         assert_eq!(out_col("note"), "note");
     }

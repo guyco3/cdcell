@@ -59,7 +59,7 @@ table)`: `cdcell.<script>.<class>.<table>`, partitioned by `day(__ts)`,
 - Internal tables are not emitted: `_litestream_*`, `_cf_WAKE`, `_cf_FACETS`,
   `_cf_METADATA`, `_cf_ALARM`, `sqlite_*`, virtual tables.
 - `cdcell.<script>._cdcell_progress`: one row per touched cell per commit
-  `(_cell_id, _epoch, _txid, ce_time, committed_at, batch)`: "complete up to here".
+  `(_cell_id, _epoch, _txid, captured_at, committed_at, batch)`: "complete up to here".
 
 ## 3. Architecture
 
@@ -183,7 +183,7 @@ Prometheus on `:9464`: `cdcell_watermark_age_seconds_{max,p99}`,
 `cdcell_events_total`, `cdcell_units_total`, `cdcell_commits_total`,
 `cdcell_commit_seconds_{sum,count}`, `cdcell_{phantoms,duplicates}_dropped_total`,
 `cdcell_not_found_total`, `cdcell_decode_errors_total`,
-`cdcell_shadow_restores_total` (rebuilds from celld),
+`cdcell_rebuilds_total` (cells rebuilt or resynced from celld),
 `cdcell_reconciled_bundles_total`, `cdcell_confirm_reads_total`,
 `cdcell_s3_requests_total{op}`. Each commit logs the cells with the oldest
 pending work ("lagging cell").
