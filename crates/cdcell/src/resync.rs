@@ -50,6 +50,40 @@ pub fn key_values(key: &str) -> Vec<Option<OutValue>> {
         .collect()
 }
 
+/// Typed key columns for a delete row built from a change-log key: each PK
+/// value typed by its column's affinity (as emit does). A key whose shape
+/// does not match the table's PK (rowid tables, the `$rowid:N` fallback, a
+/// changed PK) or a value that does not fit its column yields no columns;
+/// `__key` alone identifies the row.
+pub fn key_columns(info: &cdcell_core::schema::TableInfo, key: &str) -> Vec<(String, OutValue)> {
+    use cdcell_core::Value;
+    let Ok(serde_json::Value::Array(vs)) = serde_json::from_str::<serde_json::Value>(key) else {
+        return Vec::new();
+    };
+    if info.pk.is_empty() || vs.len() != info.pk.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (&i, v) in info.pk.iter().zip(&vs) {
+        let value = match v {
+            serde_json::Value::Number(n) if n.is_i64() => Value::Integer(n.as_i64().unwrap()),
+            serde_json::Value::Number(n) => match n.as_f64() {
+                Some(f) => Value::Real(f),
+                None => return Vec::new(),
+            },
+            serde_json::Value::String(s) if s.starts_with("$rowid:") => return Vec::new(),
+            serde_json::Value::String(s) => Value::Text(s.clone()),
+            _ => return Vec::new(),
+        };
+        let col = &info.columns[i];
+        match crate::emit::typed(&value, col.affinity) {
+            Some(t) => out.push((crate::emit::out_col(&col.name), t)),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
 /// One object or buffered unit of a cell: `epoch`, TXID range, and where
 /// its pages come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,7 +203,9 @@ mod tests {
             src: "",
         }
     }
-    fn ranges(p: &Option<(Vec<Span<&'static str>>, u64)>) -> Option<(Vec<(u64, u64, u64)>, u64)> {
+    type Plan = Option<(Vec<Span<&'static str>>, u64)>;
+    type Ranges = Option<(Vec<(u64, u64, u64)>, u64)>;
+    fn ranges(p: &Plan) -> Ranges {
         p.as_ref()
             .map(|(v, r)| (v.iter().map(|s| (s.epoch, s.min, s.max)).collect(), *r))
     }
@@ -246,6 +282,62 @@ mod tests {
         );
         // nothing in the top epoch
         assert_eq!(ranges(&plan_chain(&[sp(1, 1, 5)], 2, None)), None);
+    }
+
+    fn table(
+        cols: &[(&str, cdcell_core::schema::Affinity)],
+        pk: &[usize],
+    ) -> cdcell_core::schema::TableInfo {
+        cdcell_core::schema::TableInfo {
+            name: "t".into(),
+            root: 2,
+            sql: String::new(),
+            without_rowid: false,
+            columns: cols
+                .iter()
+                .map(|(n, a)| cdcell_core::schema::Column {
+                    name: n.to_string(),
+                    decl_type: String::new(),
+                    affinity: *a,
+                    not_null: false,
+                    default: cdcell_core::Value::Null,
+                    generated: None,
+                })
+                .collect(),
+            record_order: (0..cols.len()).collect(),
+            rowid_alias: None,
+            pk: pk.to_vec(),
+        }
+    }
+
+    #[test]
+    fn key_columns_typed_by_affinity() {
+        use cdcell_core::schema::Affinity::*;
+        let t = table(&[("order_id", Integer), ("sku", Text)], &[0, 1]);
+        assert_eq!(
+            key_columns(&t, r#"[7,"a"]"#),
+            vec![
+                ("order_id".into(), OutValue::Long(7)),
+                ("sku".into(), OutValue::Str("a".into()))
+            ]
+        );
+        // untyped PK column: canonical JSON string, like emit
+        let u = table(&[("k", Untyped)], &[0]);
+        assert_eq!(
+            key_columns(&u, "[5]"),
+            vec![("k".into(), OutValue::Str("5".into()))]
+        );
+        // shape or type mismatch: `__key` only
+        assert_eq!(key_columns(&t, "[7]"), vec![]);
+        assert_eq!(
+            key_columns(&table(&[("id", Integer)], &[0]), r#"["$rowid:3"]"#),
+            vec![]
+        );
+        assert_eq!(
+            key_columns(&table(&[("id", Integer)], &[0]), r#"["x"]"#),
+            vec![]
+        );
+        assert_eq!(key_columns(&table(&[("id", Integer)], &[]), "[3]"), vec![]);
     }
 
     #[test]

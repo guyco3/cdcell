@@ -42,7 +42,9 @@ Sets and binary are tagged: `{"$date": …}`, `{"$bigint": "…"}`, `{"$map": [�
 2. **Key = `(__cell_id, __key)`.** Primary keys repeat across Durable Objects
    (every shop has an order 1).
 3. **Deletes are rows** with `__op = 'd'`. A key whose latest row is a delete
-   does not exist.
+   does not exist. `DROP TABLE` emits a delete for every row of the table, and
+   `ALTER TABLE ... RENAME TO` a delete under the old name plus a create
+   under the new one, so per-table current state stays exact.
 4. **Duplicates can appear after a cdcell crash.** They have the same
    `(__cell_id, __key, __epoch, __txid)`; merge with a version guard (below)
    or deduplicate on those four columns.
