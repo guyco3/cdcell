@@ -71,4 +71,15 @@ wait_caught_up() {
   done
   echo "   (not caught up after ${limit}s: watermark ${a:-?} s, gaps ${g:-?})"
 }
+# Verify type-1 == dump, retrying until it passes or `VERIFY_TIMEOUT_S`
+# (default 180 s) elapses: commits land on cdcell's interval, so one check
+# right after "caught up" can race the last commit. Prints the last result.
+verify_eventually() {
+  local limit=${VERIFY_TIMEOUT_S:-180} t=0 out
+  while :; do
+    if out=$(python3 -I tools/verify_type1.py "$@" 2>&1); then echo "$out"; return 0; fi
+    [ "$t" -ge "$limit" ] && { echo "$out"; return 1; }
+    sleep 10; t=$((t + 10))
+  done
+}
 

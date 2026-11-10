@@ -37,4 +37,4 @@ start_cdcell
 wait_caught_up
 docker logs cdcell-run 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "resynced|rebuilt|lagging cell" | tail -3 | cut -c1-240
 docker logs cdcell-run 2>&1 | grep -q "resynced from a later full image" || fail "no resync after the committed epoch was GC'd"
-python3 -I tools/verify_type1.py --shops "$SHOP" --allow-dups && echo "m5-epoch-gc: PASS"
+verify_eventually --shops "$SHOP" --allow-dups && echo "m5-epoch-gc: PASS"

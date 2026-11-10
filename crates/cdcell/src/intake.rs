@@ -12,13 +12,22 @@ use crate::keys::{self, ObjKey};
 use crate::pipeline::{MsgId, Origin, Pipeline, UnitIn};
 use crate::source::Store;
 
-/// The parsed key if its object carries units: per-cell L0 files and
-/// bundles not yet read by reconciliation. own.json, L1/L9 (repair
-/// candidates only) and recovery hints carry none.
+/// The parsed key if its object carries units: per-cell L0 files, bundles
+/// not yet read by reconciliation, and L1/L9 objects that reach past what
+/// cdcell has for the cell (after an outage they can be the only trace of an
+/// idle cell's changes; otherwise they are skipped without a GET). own.json
+/// and recovery hints carry none.
 pub fn wanted(pipe: &mut Pipeline, key: &str) -> Option<ObjKey> {
     let parsed = keys::parse(key);
-    match parsed {
+    match &parsed {
         ObjKey::Ltx { level: 0, .. } => Some(parsed),
+        ObjKey::Ltx {
+            level: 1 | 9,
+            cell,
+            epoch,
+            max,
+            ..
+        } => pipe.behind(cell, *epoch, *max).then_some(parsed),
         ObjKey::Bundle { .. } => pipe.mark_bundle(key).then_some(parsed),
         _ => None,
     }
