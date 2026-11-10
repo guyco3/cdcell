@@ -133,7 +133,10 @@ cookie changes on every DDL), so they arrive in the same ordered stream:
 4. **Iceberg evolution** before the commit that needs it: add missing columns
    (nullable); a value whose type conflicts with an existing column goes to
    `<col>__<type>`; dropped columns stay (null from then on); a renamed
-   column is added under its new name.
+   column is added under its new name. Dropping a table emits a delete per
+   row; renaming one moves its rows (deletes under the old name, creates
+   under the new). Table names that need escaping get a short hash suffix,
+   so two distinct names never map to one Iceberg table.
 
 celld facts this rests on (verified by experiment and code): a deploy never
 changes cell ids, class identity or epochs; a cell's schema changes only when

@@ -660,19 +660,15 @@ impl Pipeline {
                 }
             }
             for k in crate::resync::owed_deletes(&live, &image_keys) {
-                let vals = crate::resync::key_values(&k);
                 let cols: Vec<(String, iceberg_out::OutValue)> = if kv {
-                    vals.into_iter()
+                    crate::resync::key_values(&k)
+                        .into_iter()
                         .last()
                         .flatten()
                         .map(|v| vec![("k".to_string(), v)])
                         .unwrap_or_default()
                 } else {
-                    info.pk
-                        .iter()
-                        .zip(vals)
-                        .filter_map(|(&i, v)| Some((emit::out_col(&info.columns[i].name), v?)))
-                        .collect()
+                    crate::resync::key_columns(info, &k)
                 };
                 out.push((table.clone(), emit::delete_row(&ctx, &k, &fp, cols)));
                 deletes += 1;
