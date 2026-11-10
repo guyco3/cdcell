@@ -71,7 +71,10 @@ impl PageHeader {
 pub fn page_header(page: &[u8], pgno: u32) -> Result<PageHeader> {
     let off = if pgno == 1 { 100 } else { 0 };
     let kind = *page.get(off).ok_or(Error::Malformed("short page"))?;
-    if !matches!(kind, INDEX_INTERIOR | TABLE_INTERIOR | INDEX_LEAF | TABLE_LEAF) {
+    if !matches!(
+        kind,
+        INDEX_INTERIOR | TABLE_INTERIOR | INDEX_LEAF | TABLE_LEAF
+    ) {
         return Err(Error::NotBtree(pgno, kind));
     }
     let ncell = usize::from(be_u16(&page[off + 3..]));
@@ -81,14 +84,24 @@ pub fn page_header(page: &[u8], pgno: u32) -> Result<PageHeader> {
     if ptrs + 2 * ncell > page.len() {
         return Err(Error::Malformed("cell pointer array past end"));
     }
-    let cells = (0..ncell).map(|i| usize::from(be_u16(&page[ptrs + 2 * i..]))).collect();
-    Ok(PageHeader { kind, cells, right_child })
+    let cells = (0..ncell)
+        .map(|i| usize::from(be_u16(&page[ptrs + 2 * i..])))
+        .collect();
+    Ok(PageHeader {
+        kind,
+        cells,
+        right_child,
+    })
 }
 
 /// Bytes of a payload stored on the b-tree page itself (fileformat2 §1.6).
 pub fn local_payload_size(payload: u64, usable: usize, is_table_leaf: bool) -> usize {
     let u = usable as u64;
-    let x = if is_table_leaf { u - 35 } else { ((u - 12) * 64 / 255) - 23 };
+    let x = if is_table_leaf {
+        u - 35
+    } else {
+        ((u - 12) * 64 / 255) - 23
+    };
     if payload <= x {
         return payload as usize;
     }
@@ -113,7 +126,9 @@ pub fn record(payload: &[u8], enc: TextEncoding) -> Result<Vec<Value>> {
     let mut q = header_len;
     let mut out = Vec::with_capacity(types.len());
     let take = |q: &mut usize, n: usize| -> Result<&[u8]> {
-        let s = payload.get(*q..*q + n).ok_or(Error::Malformed("record body past end"))?;
+        let s = payload
+            .get(*q..*q + n)
+            .ok_or(Error::Malformed("record body past end"))?;
         *q += n;
         Ok(s)
     };
@@ -152,7 +167,9 @@ fn decode_text(b: &[u8], enc: TextEncoding) -> Result<String> {
         TextEncoding::Utf8 => Ok(String::from_utf8_lossy(b).into_owned()),
         TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
             let units: Vec<u16> = b
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
                     if enc == TextEncoding::Utf16Le {
                         u16::from_le_bytes([c[0], c[1]])
@@ -181,7 +198,10 @@ mod tests {
     fn records() {
         // header len 4: types int8(1), text len 1 (15), null(0); body 0x2a 'x'
         let r = record(&[4, 1, 15, 0, 0x2a, b'x'], TextEncoding::Utf8).unwrap();
-        assert_eq!(r, vec![Value::Integer(42), Value::Text("x".into()), Value::Null]);
+        assert_eq!(
+            r,
+            vec![Value::Integer(42), Value::Text("x".into()), Value::Null]
+        );
         // negative 16-bit
         let r = record(&[2, 2, 0xff, 0xfe], TextEncoding::Utf8).unwrap();
         assert_eq!(r, vec![Value::Integer(-2)]);

@@ -3,7 +3,7 @@ name = "cdcell"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "CDC from celld Durable Objects to Iceberg (CloudEvents + Debezium)."
+description = "CDC from celld Durable Objects to append-only Iceberg change logs."
 
 [dependencies]
 cdcell-core = { path = "../cdcell-core" }

@@ -115,13 +115,21 @@ pub struct SchemaRow {
     pub sql: String,
 }
 
-pub fn schema_cookie(pages: &Pages, overlay: Option<&std::collections::HashMap<u32, Vec<u8>>>) -> Option<u32> {
-    let p1 = overlay.and_then(|o| o.get(&1)).or_else(|| pages.pages.get(&1))?;
+pub fn schema_cookie(
+    pages: &Pages,
+    overlay: Option<&std::collections::HashMap<u32, Vec<u8>>>,
+) -> Option<u32> {
+    let p1 = overlay
+        .and_then(|o| o.get(&1))
+        .or_else(|| pages.pages.get(&1))?;
     Some(crate::format::be_u32(&p1[40..44]))
 }
 
 /// Reads `sqlite_schema` (the table b-tree rooted at page 1).
-pub fn read_schema_rows(view: &View<'_>, enc: crate::format::TextEncoding) -> Result<Vec<SchemaRow>> {
+pub fn read_schema_rows(
+    view: &View<'_>,
+    enc: crate::format::TextEncoding,
+) -> Result<Vec<SchemaRow>> {
     let s = btree::walk(view, 1)?;
     let mut rows = Vec::new();
     for p in s.entry_pages() {
@@ -134,7 +142,12 @@ pub fn read_schema_rows(view: &View<'_>, enc: crate::format::TextEncoding) -> Re
                 Some(Value::Integer(r)) => *r as u32,
                 _ => 0,
             };
-            rows.push(SchemaRow { kind: text(0), name: text(1), root, sql: text(4) });
+            rows.push(SchemaRow {
+                kind: text(0),
+                name: text(1),
+                root,
+                sql: text(4),
+            });
         }
     }
     Ok(rows)
@@ -145,7 +158,10 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Full table metadata for every ordinary table with a b-tree (virtual tables
 /// have root page 0 and are skipped).
 pub fn load_tables(image: &[u8], rows: &[SchemaRow]) -> Result<BTreeMap<String, TableInfo>> {
-    let tables: Vec<&SchemaRow> = rows.iter().filter(|r| r.kind == "table" && r.root != 0).collect();
+    let tables: Vec<&SchemaRow> = rows
+        .iter()
+        .filter(|r| r.kind == "table" && r.root != 0)
+        .collect();
     if tables.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -165,17 +181,31 @@ pub fn load_tables(image: &[u8], rows: &[SchemaRow]) -> Result<BTreeMap<String, 
     result
 }
 
-fn load_with_sqlite(path: &std::path::Path, tables: &[&SchemaRow]) -> Result<BTreeMap<String, TableInfo>> {
+fn load_with_sqlite(
+    path: &std::path::Path,
+    tables: &[&SchemaRow],
+) -> Result<BTreeMap<String, TableInfo>> {
     use rusqlite::{Connection, OpenFlags};
     let err = |e: rusqlite::Error| Error::Schema(e.to_string());
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
     let mut out = BTreeMap::new();
     for t in tables {
         let quoted = t.name.replace('"', "\"\"");
-        let mut stmt = conn.prepare(&format!("PRAGMA table_xinfo(\"{quoted}\")")).map_err(err)?;
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_xinfo(\"{quoted}\")"))
+            .map_err(err)?;
         // cid, name, type, notnull, dflt_value, pk, hidden
         let raw: Vec<(String, String, bool, Option<String>, i64, i64)> = stmt
-            .query_map([], |r| Ok((r.get(1)?, r.get::<_, Option<String>>(2)?.unwrap_or_default(), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get(1)?,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
             .map_err(err)?
             .collect::<std::result::Result<_, _>>()
             .map_err(err)?;
@@ -187,7 +217,9 @@ fn load_with_sqlite(path: &std::path::Path, tables: &[&SchemaRow]) -> Result<BTr
             }
             let default = match dflt {
                 Some(expr) => conn
-                    .query_row(&format!("SELECT {expr}"), [], |r| r.get::<_, rusqlite::types::Value>(0))
+                    .query_row(&format!("SELECT {expr}"), [], |r| {
+                        r.get::<_, rusqlite::types::Value>(0)
+                    })
                     .map(from_sqlite)
                     .unwrap_or(Value::Null),
                 None => Value::Null,
@@ -200,7 +232,14 @@ fn load_with_sqlite(path: &std::path::Path, tables: &[&SchemaRow]) -> Result<BTr
             if pk > 0 {
                 pk_pos.push((pk, columns.len()));
             }
-            columns.push(Column { affinity: Affinity::from_decl(&decl), decl_type: decl, name, not_null, default, generated });
+            columns.push(Column {
+                affinity: Affinity::from_decl(&decl),
+                decl_type: decl,
+                name,
+                not_null,
+                default,
+                generated,
+            });
         }
         pk_pos.sort();
         let pk: Vec<usize> = pk_pos.into_iter().map(|(_, c)| c).collect();
@@ -210,7 +249,9 @@ fn load_with_sqlite(path: &std::path::Path, tables: &[&SchemaRow]) -> Result<BTr
             && columns[pk[0]].decl_type.eq_ignore_ascii_case("INTEGER")
             && !has_pk_desc(&t.sql))
         .then(|| pk[0]);
-        let stored: Vec<usize> = (0..columns.len()).filter(|&c| columns[c].generated != Some(Generated::Virtual)).collect();
+        let stored: Vec<usize> = (0..columns.len())
+            .filter(|&c| columns[c].generated != Some(Generated::Virtual))
+            .collect();
         let record_order = if without_rowid {
             let mut order = pk.clone();
             order.extend(stored.iter().copied().filter(|c| !pk.contains(c)));
@@ -220,7 +261,16 @@ fn load_with_sqlite(path: &std::path::Path, tables: &[&SchemaRow]) -> Result<BTr
         };
         out.insert(
             t.name.clone(),
-            TableInfo { name: t.name.clone(), root: t.root, sql: t.sql.clone(), without_rowid, columns, record_order, rowid_alias, pk },
+            TableInfo {
+                name: t.name.clone(),
+                root: t.root,
+                sql: t.sql.clone(),
+                without_rowid,
+                columns,
+                record_order,
+                rowid_alias,
+                pk,
+            },
         );
     }
     Ok(out)
@@ -238,7 +288,10 @@ fn from_sqlite(v: rusqlite::types::Value) -> Value {
 }
 
 fn normalized(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_uppercase()
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
 }
 
 fn is_without_rowid(sql: &str) -> bool {
@@ -256,5 +309,8 @@ fn has_pk_desc(sql: &str) -> bool {
 pub fn is_internal(name: &str) -> bool {
     name.starts_with("sqlite_")
         || name.starts_with("_litestream_")
-        || matches!(name, "_cf_WAKE" | "_cf_FACETS" | "_cf_METADATA" | "_cf_ALARM")
+        || matches!(
+            name,
+            "_cf_WAKE" | "_cf_FACETS" | "_cf_METADATA" | "_cf_ALARM"
+        )
 }

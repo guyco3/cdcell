@@ -1,4 +1,4 @@
-//! `cdcell run`: notifications → pipeline → Iceberg (design §3, §9).
+//! `cdcell run`: notifications → pipeline → Iceberg (design §3).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -36,7 +36,14 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Config {
         let e = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-        let secs = |k: &str, d: u64| Duration::from_secs(std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d));
+        let secs = |k: &str, d: u64| {
+            Duration::from_secs(
+                std::env::var(k)
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d),
+            )
+        };
         Config {
             nats_url: e("CDCELL_NATS_URL", "nats://nats:4222"),
             stream: e("CDCELL_STREAM", "CELLD"),
@@ -60,24 +67,36 @@ impl Config {
     }
 }
 
-/// The Worker script name (design §3.1): config, else `deploy/current.json`.
+/// The Worker script name (design §3): config, else `deploy/current.json`.
 async fn script_name(cfg: &Config, src: &Store) -> Result<String> {
     if !cfg.script.is_empty() {
         return Ok(cfg.script.clone());
     }
-    let body = src.get("deploy/current.json").await?.context("deploy/current.json missing; set CDCELL_SCRIPT")?;
+    let body = src
+        .get("deploy/current.json")
+        .await?
+        .context("deploy/current.json missing; set CDCELL_SCRIPT")?;
     let v: serde_json::Value = serde_json::from_slice(&body)?;
-    Ok(v["script_name"].as_str().context("script_name")?.to_string())
+    Ok(v["script_name"]
+        .as_str()
+        .context("script_name")?
+        .to_string())
 }
 
 /// Objects named by one notification message (S3 / MinIO `Records`).
 fn keys_of(payload: &[u8], prefix: &str) -> Vec<String> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else { return Vec::new() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return Vec::new();
+    };
     v["Records"]
         .as_array()
         .map(|rs| {
             rs.iter()
-                .filter(|r| r["eventName"].as_str().is_some_and(|n| n.contains("ObjectCreated")))
+                .filter(|r| {
+                    r["eventName"]
+                        .as_str()
+                        .is_some_and(|n| n.contains("ObjectCreated"))
+                })
                 .filter_map(|r| r["s3"]["object"]["key"].as_str())
                 .map(keys::url_decode)
                 .filter_map(|k| k.strip_prefix(prefix).map(str::to_string))
@@ -87,23 +106,59 @@ fn keys_of(payload: &[u8], prefix: &str) -> Vec<String> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let src = Store::s3(&cfg.source_endpoint, &cfg.source_bucket, &cfg.source_prefix, &cfg.source_key, &cfg.source_secret)?;
-    let state = Store::s3(&cfg.state_endpoint, &cfg.state_bucket, &cfg.state_prefix, &cfg.state_key, &cfg.state_secret)?;
+    let src = Store::s3(
+        &cfg.source_endpoint,
+        &cfg.source_bucket,
+        &cfg.source_prefix,
+        &cfg.source_key,
+        &cfg.source_secret,
+    )?;
+    let state = Store::s3(
+        &cfg.state_endpoint,
+        &cfg.state_bucket,
+        &cfg.state_prefix,
+        &cfg.state_key,
+        &cfg.state_secret,
+    )?;
     let script = script_name(&cfg, &src).await?;
     let sink = crate::iceberg_out::Sink::connect(&cfg.catalog, &cfg.warehouse).await?;
-    let mut pipe = Pipeline::new(src.clone(), state, sink, Settings { script: script.clone(), gap_timeout: cfg.gap_timeout });
+    let mut pipe = Pipeline::new(
+        src.clone(),
+        state,
+        sink,
+        Settings {
+            script: script.clone(),
+            gap_timeout: cfg.gap_timeout,
+        },
+    );
 
-    crate::metrics::serve(&std::env::var("CDCELL_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9464".into())).await?;
+    crate::metrics::serve(
+        &std::env::var("CDCELL_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9464".into()),
+    )
+    .await?;
     pipe.acquire_lease(Duration::from_secs(30)).await?;
     pipe.recover().await?;
-    let drop_pct: u64 = std::env::var("CDCELL_TEST_DROP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let reconcile_every = Duration::from_secs(std::env::var("CDCELL_RECONCILE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(300));
+    let drop_pct: u64 = std::env::var("CDCELL_TEST_DROP_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let reconcile_every = Duration::from_secs(
+        std::env::var("CDCELL_RECONCILE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    );
     let mut last_reconcile = Instant::now();
     let mut last_renew = Instant::now();
 
-    let nats = async_nats::connect(&cfg.nats_url).await.context("connect to NATS")?;
+    let nats = async_nats::connect(&cfg.nats_url)
+        .await
+        .context("connect to NATS")?;
     let js = jetstream::new(nats);
-    let stream = js.get_stream(&cfg.stream).await.context("JetStream stream")?;
+    let stream = js
+        .get_stream(&cfg.stream)
+        .await
+        .context("JetStream stream")?;
     let consumer: jetstream::consumer::Consumer<pull::Config> = stream
         .get_or_create_consumer(
             &cfg.consumer,
@@ -124,10 +179,15 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut last_commit = Instant::now();
     loop {
         // 1. intake: up to 500 messages or 1 s
-        let mut batch = consumer.fetch().max_messages(500).expires(Duration::from_secs(1)).messages().await?;
+        let mut batch = consumer
+            .fetch()
+            .max_messages(500)
+            .expires(Duration::from_secs(1))
+            .messages()
+            .await?;
         // Collect the batch, then GET + decode its objects concurrently:
         // bundles are GC'd ~30-40 s after coverage, so intake must keep up
-        // (design §4.3). Units are added in message order afterwards.
+        // (design §3). Units are added in message order afterwards.
         let mut fetched: Vec<(MsgId, Vec<(String, ObjKey)>)> = Vec::new();
         while let Some(msg) = batch.next().await {
             let msg = match msg {
@@ -159,7 +219,9 @@ pub async fn run(cfg: Config) -> Result<()> {
             fetched.push((id, keys));
             held.insert(id, msg);
         }
-        let jobs = fetched.iter().flat_map(|(id, keys)| keys.iter().map(move |(k, p)| (*id, k.clone(), p.clone())));
+        let jobs = fetched
+            .iter()
+            .flat_map(|(id, keys)| keys.iter().map(move |(k, p)| (*id, k.clone(), p.clone())));
         let mut results: Vec<(MsgId, Vec<UnitIn>)> = futures::stream::iter(jobs)
             .map(|(id, key, parsed)| {
                 let src = src.clone();
@@ -167,21 +229,42 @@ pub async fn run(cfg: Config) -> Result<()> {
                     let got_at = Instant::now();
                     let body = src.get(&key).await?;
                     let mut units = Vec::new();
-                    let Some(body) = body else { return anyhow::Ok((id, units)) };
+                    let Some(body) = body else {
+                        return anyhow::Ok((id, units));
+                    };
                     match parsed {
-                        ObjKey::Ltx { cell, epoch, .. } => match cdcell_core::ltx::decode_file(&body) {
-                            Ok(unit) => units.push(UnitIn { cell, epoch, unit, origin: Origin::Cell, msg: Some(id), got_at, bootstrap: false }),
-                            Err(e) => {
-                                crate::metrics::inc(&crate::metrics::M.decode_errors);
-                                warn!(key, %e, "undecodable LTX object")
+                        ObjKey::Ltx { cell, epoch, .. } => {
+                            match cdcell_core::ltx::decode_file(&body) {
+                                Ok(unit) => units.push(UnitIn {
+                                    cell,
+                                    epoch,
+                                    unit,
+                                    origin: Origin::Cell,
+                                    msg: Some(id),
+                                    got_at,
+                                    bootstrap: false,
+                                }),
+                                Err(e) => {
+                                    crate::metrics::inc(&crate::metrics::M.decode_errors);
+                                    warn!(key, %e, "undecodable LTX object")
+                                }
                             }
-                        },
-                        ObjKey::Bundle { node, generation, log_epoch, .. } => match cdcell_core::ltx::decode_bundle(&body) {
+                        }
+                        ObjKey::Bundle {
+                            node,
+                            generation,
+                            log_epoch,
+                            ..
+                        } => match cdcell_core::ltx::decode_bundle(&body) {
                             Ok(rows) => units.extend(rows.into_iter().map(|r| UnitIn {
                                 cell: r.cell,
                                 epoch: r.cell_epoch,
                                 unit: r.unit,
-                                origin: Origin::Bundle { node: node.clone(), generation: generation.clone(), log_epoch },
+                                origin: Origin::Bundle {
+                                    node: node.clone(),
+                                    generation: generation.clone(),
+                                    log_epoch,
+                                },
                                 msg: Some(id),
                                 got_at,
                                 bootstrap: false,
@@ -236,7 +319,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 }
             }
         }
-        // keep long-held messages alive while they wait (design §9)
+        // keep long-held messages alive while they wait (design §3)
         let _ = &held;
     }
 }

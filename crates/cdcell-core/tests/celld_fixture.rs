@@ -28,13 +28,21 @@ fn text(v: &Value) -> String {
 }
 
 fn col<'a>(row: &'a [(String, Value)], name: &str) -> &'a Value {
-    &row.iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no column {name}")).1
+    &row.iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("no column {name}"))
+        .1
 }
 
 fn check_fixture(dir: &Path) {
-    let meta: J = serde_json::from_str(&std::fs::read_to_string(dir.join("dump.json")).unwrap()).unwrap();
+    let meta: J =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("dump.json")).unwrap()).unwrap();
     let dump = &meta["dump"];
-    let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "ltx")).collect();
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ltx"))
+        .collect();
     files.sort();
 
     let mut dec = Decoder::new();
@@ -42,10 +50,21 @@ fn check_fixture(dir: &Path) {
     let mut expect_txid = 1;
     for (i, f) in files.iter().enumerate() {
         let unit = cdcell_core::ltx::decode_file(&std::fs::read(f).unwrap()).unwrap();
-        assert_eq!(unit.min_txid, expect_txid, "{}: TXIDs must be contiguous", f.display());
-        assert_eq!(unit.is_snapshot(), i == 0, "only the first unit is a TXID-1 snapshot");
+        assert_eq!(
+            unit.min_txid,
+            expect_txid,
+            "{}: TXIDs must be contiguous",
+            f.display()
+        );
+        assert_eq!(
+            unit.is_snapshot(),
+            i == 0,
+            "only the first unit is a TXID-1 snapshot"
+        );
         expect_txid = unit.max_txid + 1;
-        let changes = dec.apply(unit.pages, unit.commit).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let changes = dec
+            .apply(unit.pages, unit.commit)
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
         for c in changes.rows.iter().filter(|c| c.op == Op::Update) {
             *updates_by_table.entry(c.table.clone()).or_default() += 1;
         }
@@ -60,7 +79,10 @@ fn check_fixture(dir: &Path) {
         assert_eq!(text(col(row, "customer")), w["customer"].as_str().unwrap());
         assert_eq!(text(col(row, "status")), w["status"].as_str().unwrap());
         assert!((num(col(row, "total")) - w["total"].as_f64().unwrap()).abs() < 1e-9);
-        assert_eq!(num(col(row, "updated_at")), w["updated_at"].as_f64().unwrap());
+        assert_eq!(
+            num(col(row, "updated_at")),
+            w["updated_at"].as_f64().unwrap()
+        );
     }
     // items (WITHOUT ROWID, composite key)
     let items = dec.rows("items").unwrap();
@@ -76,14 +98,28 @@ fn check_fixture(dir: &Path) {
     assert_eq!(att.len(), want.len(), "attachments row count");
     for w in want {
         let (_, row) = &att[&format!("[{}]", w["id"])];
-        let Value::Blob(b) = col(row, "data") else { panic!("data not a blob") };
+        let Value::Blob(b) = col(row, "data") else {
+            panic!("data not a blob")
+        };
         assert_eq!(b.len() as u64, w["bytes"].as_u64().unwrap());
-        let tail: String = b[b.len() - 4..].iter().map(|x| format!("{x:02X}")).collect();
-        assert_eq!(tail, w["tail"].as_str().unwrap(), "attachment {} tail (overflow-only retouch)", w["id"]);
+        let tail: String = b[b.len() - 4..]
+            .iter()
+            .map(|x| format!("{x:02X}"))
+            .collect();
+        assert_eq!(
+            tail,
+            w["tail"].as_str().unwrap(),
+            "attachment {} tail (overflow-only retouch)",
+            w["id"]
+        );
     }
     // KV: the keys stored through ctx.storage.put
     let kv = dec.rows("_cf_KV").unwrap();
-    let mut got: Vec<String> = kv.values().map(|(_, r)| text(col(r, "k"))).filter(|k| k.starts_with("pref:")).collect();
+    let mut got: Vec<String> = kv
+        .values()
+        .map(|(_, r)| text(col(r, "k")))
+        .filter(|k| k.starts_with("pref:"))
+        .collect();
     got.sort();
     let mut want: Vec<String> = dump["kv"].as_object().unwrap().keys().cloned().collect();
     want.sort();
@@ -93,7 +129,8 @@ fn check_fixture(dir: &Path) {
         let k = text(col(r, "k"));
         if let Some(expected) = dump["kv"].get(&k) {
             let decoded = cdcell_core::kv::decode(col(r, "v"));
-            let parsed: J = serde_json::from_str(decoded.value_json.as_deref().expect("decodable")).unwrap();
+            let parsed: J =
+                serde_json::from_str(decoded.value_json.as_deref().expect("decodable")).unwrap();
             assert_eq!(&parsed, expected, "KV value {k} ({:?})", decoded.value_type);
         }
     }
@@ -104,7 +141,10 @@ fn check_fixture(dir: &Path) {
         dir.display(), files.len(), orders.len(), items.len(), att.len(), kv.len(), updates_by_table, retouches, dec.stats
     );
     if retouches > 0 {
-        assert!(updates_by_table.get("attachments").copied().unwrap_or(0) > 0, "retouches must surface as attachment updates");
+        assert!(
+            updates_by_table.get("attachments").copied().unwrap_or(0) > 0,
+            "retouches must surface as attachment updates"
+        );
     }
 }
 

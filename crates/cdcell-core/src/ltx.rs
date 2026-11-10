@@ -23,7 +23,10 @@ impl Unit {
     }
     /// A paged-epoch continuation marker: one TXID, zero pages, empty WAL.
     pub fn is_paged_marker(&self) -> bool {
-        self.min_txid == self.max_txid && self.pages.is_empty() && self.wal_size == 0 && self.min_txid > 1
+        self.min_txid == self.max_txid
+            && self.pages.is_empty()
+            && self.wal_size == 0
+            && self.min_txid > 1
     }
 }
 
@@ -57,7 +60,12 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<Vec<BundleUnit>> {
     rows.iter()
         .map(|r| {
             let l0 = celld_ltx::bundle::slice(bytes, r).map_err(|e| Error::Ltx(e.to_string()))?;
-            Ok(BundleUnit { cell: r.cell.clone(), cell_epoch: r.cell_epoch, txid: r.txid, unit: decode_file(l0)? })
+            Ok(BundleUnit {
+                cell: r.cell.clone(),
+                cell_epoch: r.cell_epoch,
+                txid: r.txid,
+                unit: decode_file(l0)?,
+            })
         })
         .collect()
 }
