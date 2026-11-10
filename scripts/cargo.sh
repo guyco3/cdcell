@@ -14,6 +14,6 @@ exec docker run --rm -i \
   -v "$DEV:/work" -w /work/cdcell \
   -v cdcell-cargo-registry:/usr/local/cargo/registry \
   -v cdcell-target:/work/cdcell/target \
-  -e CARGO_TERM_COLOR=never \
+  -e CARGO_TERM_COLOR=never ${CDCELL_TEST_LOG:+-e CDCELL_TEST_LOG="$CDCELL_TEST_LOG"} \
   ${RUST_NET:+--network "$RUST_NET"} \
   "$IMAGE" cargo "$@"

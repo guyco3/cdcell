@@ -37,7 +37,20 @@ struct CellSim {
     image: Vec<u8>,
 }
 
-/// A single-node celld: per-cell L0 files, snapshots, folds, epoch GC.
+/// A fleet node's log session: its lease and the bundle being filled.
+struct Session {
+    generation: String,
+    log_epoch: u64,
+    seq: u64,
+    sealed: bool,
+    pending: Vec<celld_ltx::bundle::BundleEntry>,
+}
+
+/// A celld deployment. Single-node mode: each transaction is a per-cell L0
+/// object. Fleet mode (`fleet()`): transactions go into node bundles
+/// (`log/<node>/<gen>/bundle/e<LE>-<seq>.ltxb`, celld's encoder) confirmed by
+/// the node lease (`nodes/<node>.json`); per-cell objects appear on drains,
+/// folds and snapshots.
 pub struct Celld {
     pub bucket: Store,
     /// Every notification ever sent (object keys, in order).
@@ -45,6 +58,8 @@ pub struct Celld {
     cells: BTreeMap<String, CellSim>,
     dir: PathBuf,
     ts_ms: i64,
+    /// Fleet mode: the writing node's session.
+    session: Option<Session>,
 }
 
 fn ltx_key(cell: &str, epoch: u64, level: u32, min: u64, max: u64) -> String {
@@ -92,6 +107,138 @@ impl Celld {
             cells: BTreeMap::new(),
             dir,
             ts_ms: 1_700_000_000_000,
+            session: None,
+        }
+    }
+
+    /// Switches to fleet mode: node `n1` opens log session generation `g1`.
+    pub async fn fleet(&mut self) {
+        self.session = Some(Session {
+            generation: "g1".into(),
+            log_epoch: 1,
+            seq: 0,
+            sealed: false,
+            pending: Vec::new(),
+        });
+        self.write_lease().await;
+    }
+
+    async fn write_lease(&mut self) {
+        let s = self.session.as_ref().unwrap();
+        let state = if s.sealed { "sealed" } else { "open" };
+        let lease = serde_json::json!({
+            "node": "n1",
+            "ownership_index_generation": s.generation,
+            "log": {"state": state, "epoch": s.log_epoch},
+        });
+        self.bucket
+            .put("nodes/n1.json", serde_json::to_vec(&lease).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Fleet: writes the pending segments as one bundle (and notifies it).
+    pub async fn flush(&mut self) {
+        let s = self.session.as_mut().unwrap();
+        if s.pending.is_empty() {
+            return;
+        }
+        s.seq += 1;
+        let key = format!(
+            "log/n1/{}/bundle/e{}-{:016x}.ltxb",
+            s.generation, s.log_epoch, s.seq
+        );
+        let body = celld_ltx::bundle::encode(&s.pending).expect("encode bundle");
+        s.pending.clear();
+        self.put(key, body).await;
+    }
+
+    /// Fleet: the node's log session is sealed (it lost its lease): its
+    /// bundles can no longer be confirmed.
+    pub async fn seal(&mut self) {
+        self.session.as_mut().unwrap().sealed = true;
+        self.write_lease().await;
+    }
+
+    /// Fleet: drains a cell's TXIDs `from..=to` into its per-cell prefix as
+    /// L0 objects (what celld does before it GCs a bundle).
+    pub async fn drain(&mut self, cell: &str, from: u64, to: u64) {
+        let keys = self.bundle_keys().await;
+        for k in keys {
+            let body = self.bucket.get(&k).await.unwrap().unwrap();
+            for row in cdcell_core::ltx::decode_bundle(&body).unwrap() {
+                if row.cell == cell && (from..=to).contains(&row.unit.max_txid) {
+                    let u = &row.unit;
+                    let ltx = encode(u.min_txid, u.max_txid, u.commit, u.timestamp_ms, &u.pages);
+                    self.put(
+                        ltx_key(cell, row.cell_epoch, 0, u.min_txid, u.max_txid),
+                        ltx,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Fleet: like [`Self::drain`], but as one merged per-cell object
+    /// `from-to` (a recovered session folded into the cell's prefix).
+    pub async fn drain_merged(&mut self, cell: &str, from: u64, to: u64) {
+        let mut rows = Vec::new();
+        for k in self.bundle_keys().await {
+            let body = self.bucket.get(&k).await.unwrap().unwrap();
+            rows.extend(
+                cdcell_core::ltx::decode_bundle(&body)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|r| r.cell == cell && (from..=to).contains(&r.unit.max_txid)),
+            );
+        }
+        rows.sort_by_key(|r| r.unit.max_txid);
+        let (epoch, last) = (rows[0].cell_epoch, rows.last().unwrap().unit.clone());
+        let mut pages: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for r in &rows {
+            for (p, d) in &r.unit.pages {
+                pages.insert(*p, d.clone());
+            }
+        }
+        let pages: Vec<(u32, Vec<u8>)> = pages
+            .into_iter()
+            .filter(|(p, _)| *p <= last.commit)
+            .collect();
+        let ltx = encode(from, to, last.commit, last.timestamp_ms, &pages);
+        self.put(ltx_key(cell, epoch, 0, from, to), ltx).await;
+    }
+
+    /// Fleet: deletes every bundle (celld GCs them once per-cell objects
+    /// cover them).
+    pub async fn gc_bundles(&mut self) {
+        for k in self.bundle_keys().await {
+            self.bucket.delete(&k).await.unwrap();
+        }
+    }
+
+    async fn bundle_keys(&self) -> Vec<String> {
+        self.bucket
+            .list("log/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.ends_with(".ltxb"))
+            .collect()
+    }
+
+    /// Writes one LTX for a cell: a per-cell L0 object, or in fleet mode a
+    /// bundle segment.
+    async fn write_l0(&mut self, cell: &str, epoch: u64, min: u64, max: u64, ltx: Vec<u8>) {
+        if let Some(s) = self.session.as_mut() {
+            s.pending.push(celld_ltx::bundle::BundleEntry {
+                cell: cell.to_string(),
+                cell_epoch: epoch,
+                txid: max,
+                bytes: ltx,
+            });
+        } else {
+            self.put(ltx_key(cell, epoch, 0, min, max), ltx).await;
         }
     }
 
@@ -144,7 +291,26 @@ impl Celld {
             .put(&format!("cells/{cell}/own.json"), own)
             .await
             .unwrap();
-        self.put(ltx_key(cell, epoch, 0, 1, 1), body).await;
+        self.write_l0(cell, epoch, 1, 1, body).await;
+    }
+
+    /// A paged activation (celld D2, a large chain restored lazily): the new
+    /// epoch opens with a zero-page marker at `cut + 1`, and TXIDs continue
+    /// from there; the base stays in the lower epochs (the restore chain).
+    pub async fn activate_paged(&mut self, cell: &str, epoch: u64) {
+        let ts = self.tick();
+        let c = self.cells.get_mut(cell).unwrap();
+        let marker = c.txid + 1;
+        c.epoch = epoch;
+        c.txid = marker;
+        let commit = (c.image.len() / PAGE_SIZE as usize) as u32;
+        let body = encode(marker, marker, commit, ts, &[]);
+        let own = serde_json::to_vec(&serde_json::json!({"node": "n1", "epoch": epoch})).unwrap();
+        self.bucket
+            .put(&format!("cells/{cell}/own.json"), own)
+            .await
+            .unwrap();
+        self.write_l0(cell, epoch, marker, marker, body).await;
     }
 
     /// One transaction: its changed pages become the next TXID's L0.
@@ -170,7 +336,7 @@ impl Celld {
         let (epoch, txid) = (c.epoch, c.txid);
         let commit = (c.image.len() / ps) as u32;
         let body = encode(txid, txid, commit, ts, &changed);
-        self.put(ltx_key(cell, epoch, 0, txid, txid), body).await;
+        self.write_l0(cell, epoch, txid, txid, body).await;
     }
 
     /// An L9 snapshot (a clean close/handoff): the full image, TXID 1..now.
@@ -271,6 +437,11 @@ async fn start(celld: &Celld, state: &Store, sink: &Arc<MemSink>) -> Pipeline {
 impl Harness {
     pub async fn new() -> Harness {
         cdcell::pipeline::use_test_clock();
+        // logs show with `cargo test -- --nocapture` (RUST_LOG-style filter)
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(std::env::var("CDCELL_TEST_LOG").unwrap_or_else(|_| "warn".into()))
+            .try_init();
         let celld = Celld::new();
         let state = Store::memory();
         let sink = Arc::new(MemSink::new());
@@ -288,6 +459,32 @@ impl Harness {
     pub async fn deliver(&mut self) {
         let keys: Vec<String> = self.celld.notified[self.delivered..].to_vec();
         self.delivered = self.celld.notified.len();
+        for k in keys {
+            cdcell::intake::ingest(&mut self.pipe, &self.celld.bucket, &k)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Delivers the undelivered notifications whose key contains `needle`,
+    /// leaving the others queued (controls arrival order).
+    pub async fn deliver_matching(&mut self, needle: &str) {
+        let keys: Vec<String> = self.celld.notified[self.delivered..]
+            .iter()
+            .filter(|k| k.contains(needle))
+            .cloned()
+            .collect();
+        let rest: Vec<String> = self.celld.notified[self.delivered..]
+            .iter()
+            .filter(|k| !k.contains(needle))
+            .cloned()
+            .collect();
+        // keep the not-yet-delivered ones at the end, in order
+        let done = self.delivered;
+        self.celld.notified.truncate(done);
+        self.celld.notified.extend(keys.iter().cloned());
+        self.delivered = self.celld.notified.len();
+        self.celld.notified.extend(rest);
         for k in keys {
             cdcell::intake::ingest(&mut self.pipe, &self.celld.bucket, &k)
                 .await

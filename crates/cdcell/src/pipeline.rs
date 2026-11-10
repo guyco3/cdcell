@@ -50,6 +50,13 @@ pub struct UnitIn {
     pub bootstrap: bool,
 }
 
+/// Where a chain span's pages come from (rebuild/resync).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Src {
+    Key(String),
+    Buffered(u64, u64, u64),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verdict {
     Pending,
@@ -189,6 +196,19 @@ impl Pipeline {
         }
     }
 
+    /// Whether an object `(epoch, max)` reaches past what cdcell has for
+    /// `cell` (unknown cells: always). L1/L9 objects are fetched only then:
+    /// after an outage they can be the only trace of an idle cell's changes.
+    pub fn behind(&self, cell: &str, epoch: u64, max: u64) -> bool {
+        match self.cells.get(cell) {
+            None => true,
+            Some(st) => {
+                let have = (st.epoch.unwrap_or(0), st.confirmed_txid);
+                (epoch, max) > have && !st.buffer.keys().any(|&(e, _, m)| e == epoch && m >= max)
+            }
+        }
+    }
+
     pub fn add(&mut self, u: UnitIn) {
         self.stats.units_in += 1;
         crate::metrics::inc(&crate::metrics::M.units);
@@ -209,6 +229,18 @@ impl Pipeline {
             return;
         }
         let key = (u.epoch, u.unit.min_txid, u.unit.max_txid);
+        // The same range seen twice (a duplicate notification, or a per-cell
+        // object and a bundle row): keep a confirmed copy; otherwise the new
+        // copy replaces it and is checked again.
+        if st
+            .buffer
+            .get(&key)
+            .is_some_and(|b| b.verdict == Verdict::Confirmed)
+        {
+            self.stats.dropped += 1;
+            self.batch_msgs.extend(u.msg);
+            return;
+        }
         if let Some(old) = st.buffer.insert(
             key,
             Buffered {
@@ -216,7 +248,6 @@ impl Pipeline {
                 verdict: Verdict::Pending,
             },
         ) {
-            // same unit seen twice (duplicate notification)
             self.stats.dropped += 1;
             self.batch_msgs.extend(old.u.msg);
         }
@@ -333,126 +364,191 @@ impl Pipeline {
         }
     }
 
-    /// Rebuilds a restored cell's state from the celld bucket (design §5):
-    /// a base starting at TXID 1 (L0 snapshot, L1 fold, L9), extended by
-    /// contiguous objects up to the committed TXID. Candidates: the epoch's
-    /// per-cell objects at every level and buffered units (live bundles).
-    /// Returns false when no base is available yet.
+    /// Rebuilds a restored cell's state from the celld bucket (design §5),
+    /// following celld's restore chain ([`crate::resync::plan_chain`]):
+    /// 1. exactly at the committed point (or the best point below it, with
+    ///    re-emission up to it) from per-cell objects at every level, paged
+    ///    epochs, and buffered units;
+    /// 2. after the gap timeout, when that point is gone (an L1 fold past
+    ///    it, celld's epoch GC), resync to the head of the owner's chain:
+    ///    listed objects and confirmed units only, proven by reading
+    ///    own.json after the GETs.
+    ///
+    /// Returns false while neither is possible yet.
     async fn rebuild(&mut self, cell: &str) -> Result<bool> {
+        use crate::resync::plan_chain;
         let (epoch, committed) = self.cells[cell].committed;
-        let all = self
-            .src
-            .list(&format!("cells/{cell}/ltx/e{epoch}/"))
-            .await?;
-        let keys: Vec<String> = all.iter().filter(|k| matches!(crate::keys::parse(k), crate::keys::ObjKey::Ltx { max, .. } if max <= committed)).cloned().collect();
-        let mut cands: Vec<Unit> = self.fetch_units(keys).await?;
-        let st = self.cells.get_mut(cell).unwrap();
-        cands.extend(
-            st.buffer
-                .iter()
-                .filter(|(&(e, _, max), _)| e == epoch && max <= committed)
-                .map(|(_, b)| b.u.unit.clone()),
-        );
-        let Some(base) = cands
-            .iter()
-            .filter(|u| u.min_txid == 1)
-            .max_by_key(|u| u.max_txid)
-            .cloned()
-        else {
-            let since = *st.blocked_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= self.cfg.gap_timeout {
-                // celld folded the history past the committed point (L1)
-                // and the bundles are gone: resync from the next full image.
-                let later = all
-                    .iter()
-                    .filter_map(|k| match crate::keys::parse(k) {
-                        crate::keys::ObjKey::Ltx { min: 1, max, .. } if max > committed => {
-                            Some((max, k.clone()))
-                        }
-                        _ => None,
-                    })
-                    .min_by_key(|(m, _)| *m);
-                if let Some((_, k)) = later {
-                    if let Some(u) = self.fetch_units(vec![k]).await?.pop() {
-                        self.resync_later(cell, epoch, committed, u).await?;
-                        return Ok(true);
-                    }
-                }
-                // The committed epoch itself may be gone: celld's epoch GC
-                // (opt-in, CELLD_LTX_RETENTION_SECS) deletes prefixes below
-                // the restore base. Resync from the newest full image in the
-                // owner's current epoch: own.json names it, so it is history
-                // (phantoms only live in fenced owners' older epochs).
-                let own_epoch = self
-                    .read_json(&format!("cells/{cell}/own.json"))
-                    .await?
-                    .and_then(|j| j.get("epoch").and_then(|e| e.as_u64()));
-                if let Some(e) = own_epoch.filter(|&e| e > epoch) {
-                    let newest = self
-                        .src
-                        .list(&format!("cells/{cell}/ltx/e{e}/"))
-                        .await?
-                        .into_iter()
-                        .filter_map(|k| match crate::keys::parse(&k) {
-                            crate::keys::ObjKey::Ltx { min: 1, max, .. } => Some((max, k)),
-                            _ => None,
-                        })
-                        .max_by_key(|(m, _)| *m);
-                    if let Some((_, k)) = newest {
-                        if let Some(u) = self.fetch_units(vec![k]).await?.pop() {
-                            self.resync_later(cell, e, committed, u).await?;
-                            return Ok(true);
-                        }
-                    }
-                }
-                self.cells.get_mut(cell).unwrap().blocked_since = Some(Instant::now());
-                self.reconcile_bundles().await?; // the base may be a live bundle row
+        let listed = self.chain_spans(cell).await?;
+        // 1. at the committed point: every buffered unit at or below it was
+        //    committed before, so it is history
+        let mut spans = listed.clone();
+        spans.extend(self.buffered_spans(cell, false));
+        if let Some((plan, reached)) = plan_chain(&spans, epoch, Some(committed)) {
+            if let Some(unit) = self.assemble(cell, &plan, reached).await? {
+                let image = image_of(&unit);
+                let st = self.cells.get_mut(cell).unwrap();
+                st.dec = Decoder::from_image(&image)?;
+                st.epoch = Some(epoch);
+                st.confirmed_txid = reached;
+                st.rebuild = false;
+                st.blocked_since = None;
+                st.synthetic_until = if reached < committed { committed } else { 0 };
+                crate::metrics::inc(&crate::metrics::M.rebuilds);
+                info!(
+                    cell,
+                    epoch,
+                    committed,
+                    rebuilt_to = reached,
+                    "cell state rebuilt from the celld bucket"
+                );
+                return Ok(true);
             }
+        }
+        let st = self.cells.get_mut(cell).unwrap();
+        let since = *st.blocked_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < self.cfg.gap_timeout {
+            return Ok(false);
+        }
+        // 2. resync to the head of the owner's chain
+        if self.resync_head(cell).await? {
+            return Ok(true);
+        }
+        self.cells.get_mut(cell).unwrap().blocked_since = Some(Instant::now());
+        self.reconcile_bundles().await?; // a base may be a live bundle row
+        Ok(false)
+    }
+
+    /// Resync to the head of the owner's restore chain: listed objects and
+    /// confirmed units, proven by reading own.json after the GETs. Used when
+    /// the committed point is gone (rebuild) and when the in-memory state no
+    /// longer matches celld's chain (a paged cut through an intermediate
+    /// epoch, or below the confirmed point). Returns false when not
+    /// possible yet.
+    async fn resync_head(&mut self, cell: &str) -> Result<bool> {
+        use crate::resync::plan_chain;
+        let (epoch, committed) = self.cells[cell].committed;
+        let cur = self.cells[cell].epoch.unwrap_or(epoch).max(epoch);
+        let own = self.own_epoch(cell).await?;
+        let top = own.unwrap_or(cur).max(cur);
+        let mut spans = self.chain_spans(cell).await?;
+        spans.extend(self.buffered_spans(cell, true));
+        let Some((plan, reached)) = plan_chain(&spans, top, None) else {
             return Ok(false);
         };
-        let page_size = base.page_size as usize;
+        // A resync only moves the cell forward: a head at or below what the
+        // change log already has (celld has not compacted yet, bundles not
+        // redelivered yet) waits for a later attempt.
+        let have = (epoch, committed).max((cur, self.cells[cell].confirmed_txid));
+        if (top, reached) <= have {
+            return Ok(false);
+        }
+        let Some(unit) = self.assemble(cell, &plan, reached).await? else {
+            return Ok(false);
+        };
+        // the proof: the owner still owns `top` after the GETs
+        if self.own_epoch(cell).await? == Some(top) || (own.is_none() && top == cur) {
+            self.resync_later(cell, top, committed, unit).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// The cell's per-cell objects at every level and epoch, as chain spans.
+    async fn chain_spans(&self, cell: &str) -> Result<Vec<crate::resync::Span<Src>>> {
+        Ok(self
+            .src
+            .list(&format!("cells/{cell}/ltx/"))
+            .await?
+            .into_iter()
+            .filter_map(|k| match crate::keys::parse(&k) {
+                crate::keys::ObjKey::Ltx {
+                    epoch, min, max, ..
+                } => Some(crate::resync::Span {
+                    epoch,
+                    min,
+                    max,
+                    src: Src::Key(k),
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Buffered units as chain spans (`confirmed_only`: skip units not yet
+    /// proven to be history).
+    fn buffered_spans(&self, cell: &str, confirmed_only: bool) -> Vec<crate::resync::Span<Src>> {
+        self.cells[cell]
+            .buffer
+            .iter()
+            .filter(|(_, b)| !confirmed_only || b.verdict == Verdict::Confirmed)
+            .map(|(&(epoch, min, max), _)| crate::resync::Span {
+                epoch,
+                min,
+                max,
+                src: Src::Buffered(epoch, min, max),
+            })
+            .collect()
+    }
+
+    async fn own_epoch(&self, cell: &str) -> Result<Option<u64>> {
+        Ok(self
+            .read_json(&format!("cells/{cell}/own.json"))
+            .await?
+            .and_then(|j| j.get("epoch").and_then(|e| e.as_u64())))
+    }
+
+    /// The full image at the end of a planned chain, as one unit from TXID 1
+    /// to `reached`; `None` if an object vanished since the listing.
+    async fn assemble(
+        &self,
+        cell: &str,
+        plan: &[crate::resync::Span<Src>],
+        reached: u64,
+    ) -> Result<Option<Unit>> {
+        let keys: Vec<String> = plan
+            .iter()
+            .filter_map(|s| match &s.src {
+                Src::Key(k) => Some(k.clone()),
+                Src::Buffered(..) => None,
+            })
+            .collect();
+        let mut fetched = self.fetch_keyed(keys).await?;
+        let mut units = Vec::with_capacity(plan.len());
+        for s in plan {
+            let u = match &s.src {
+                Src::Key(k) => match fetched.remove(k) {
+                    Some(u) => u,
+                    None => return Ok(None),
+                },
+                Src::Buffered(e, a, b) => match self.cells[cell].buffer.get(&(*e, *a, *b)) {
+                    Some(b) => b.u.unit.clone(),
+                    None => return Ok(None),
+                },
+            };
+            units.push(u);
+        }
+        let Some(last) = units.last() else {
+            return Ok(None);
+        };
+        let (page_size, commit, ts) = (units[0].page_size, last.commit, last.timestamp_ms);
         let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
-        let (mut cur, mut commit) = (base.max_txid, base.commit);
-        for (p, d) in base.pages {
-            pages.insert(p, d);
-        }
-        loop {
-            let next = cands
-                .iter()
-                .filter(|u| u.min_txid <= cur + 1 && u.max_txid > cur && u.max_txid <= committed)
-                .max_by_key(|u| u.max_txid);
-            let Some(n) = next else { break };
-            for (p, d) in &n.pages {
-                pages.insert(*p, d.clone());
+        for u in units {
+            for (p, d) in u.pages {
+                pages.insert(p, d);
             }
-            cur = n.max_txid;
-            commit = n.commit;
         }
-        pages.retain(|&p, _| p <= commit);
-        let usable = page_size - usize::from(pages.get(&1).map_or(0, |p| p[20]));
-        let image = cdcell_core::btree::Pages {
-            page_size,
-            usable,
+        let mut pages: Vec<(u32, Vec<u8>)> =
+            pages.into_iter().filter(|(p, _)| *p <= commit).collect();
+        pages.sort_by_key(|(p, _)| *p);
+        Ok(Some(Unit {
+            min_txid: 1,
+            max_txid: reached,
             commit,
+            page_size,
+            timestamp_ms: ts,
+            wal_size: 0,
             pages,
-        }
-        .to_image();
-        let st = self.cells.get_mut(cell).unwrap();
-        st.dec = Decoder::from_image(&image)?;
-        st.epoch = Some(epoch);
-        st.confirmed_txid = cur;
-        st.rebuild = false;
-        st.blocked_since = None;
-        st.synthetic_until = if cur < committed { committed } else { 0 };
-        crate::metrics::inc(&crate::metrics::M.rebuilds);
-        info!(
-            cell,
-            epoch,
-            committed,
-            rebuilt_to = cur,
-            "cell state rebuilt from the celld bucket"
-        );
-        Ok(true)
+        }))
     }
 
     /// Resync from a later full image (design §6): the image's rows as
@@ -466,20 +562,7 @@ impl Pipeline {
         u: Unit,
     ) -> Result<()> {
         use cdcell_core::{Op, RowChange};
-        let page_size = u.page_size as usize;
-        let pages: HashMap<u32, Vec<u8>> = u
-            .pages
-            .into_iter()
-            .filter(|(p, _)| *p <= u.commit)
-            .collect();
-        let usable = page_size - usize::from(pages.get(&1).map_or(0, |p| p[20]));
-        let image = cdcell_core::btree::Pages {
-            page_size,
-            usable,
-            commit: u.commit,
-            pages,
-        }
-        .to_image();
+        let image = image_of(&u);
         let dec = Decoder::from_image(&image)?;
         let class = self.cells[cell].class.clone();
         let ns = vec![
@@ -493,7 +576,12 @@ impl Pipeline {
             txid: u.max_txid,
             capture_ms: u.timestamp_ms,
             now_us: now_us(),
-            kind: Kind::Synthetic,
+            // initial state of a cell cdcell had no state for, else a resync
+            kind: if self.cells[cell].epoch.is_none() {
+                Kind::Bootstrap
+            } else {
+                Kind::Synthetic
+            },
         };
         let infos: Vec<cdcell_core::schema::TableInfo> = dec
             .tables()
@@ -540,7 +628,37 @@ impl Pipeline {
                     emit::fingerprint(info),
                 )
             };
-            let live = self.sink.live_keys(&ns, &name, cell).await?;
+            let mut live = self.sink.live_keys(&ns, &name, cell).await?;
+            // Rows of this cell already in the uncommitted batch are later
+            // than the committed change log (a resync mid-run).
+            if let Some(tb) = self.batch.get(&format!("{class}/{table}")) {
+                let mut latest: HashMap<String, (i64, i64, bool)> = HashMap::new();
+                for r in &tb.rows {
+                    let get_s = |c: &str| match r.get(c) {
+                        Some(iceberg_out::OutValue::Str(v)) => v.clone(),
+                        _ => String::new(),
+                    };
+                    let get_l = |c: &str| match r.get(c) {
+                        Some(iceberg_out::OutValue::Long(v)) => *v,
+                        _ => 0,
+                    };
+                    if get_s("__cell_id") != cell {
+                        continue;
+                    }
+                    let v = (get_l("__epoch"), get_l("__txid"), get_s("__op") == "d");
+                    let e = latest.entry(get_s("__key")).or_insert(v);
+                    if (v.0, v.1) >= (e.0, e.1) {
+                        *e = v;
+                    }
+                }
+                for (k, (_, _, del)) in latest {
+                    if del {
+                        live.remove(&k);
+                    } else {
+                        live.insert(k);
+                    }
+                }
+            }
             for k in crate::resync::owed_deletes(&live, &image_keys) {
                 let vals = crate::resync::key_values(&k);
                 let cols: Vec<(String, iceberg_out::OutValue)> = if kv {
@@ -697,13 +815,25 @@ impl Pipeline {
                 })
                 .map(|(k, _)| *k)
                 .next();
+            // Candidates covering the next TXID: a confirmed one (furthest
+            // reach) wins; wait while one is pending; a suspect (a zombie's
+            // copy) never shadows confirmed history.
             let next = st.epoch.and_then(|cur| {
-                st.buffer
+                let cands: Vec<((u64, u64, u64), Verdict)> = st
+                    .buffer
                     .iter()
-                    .find(|(&(e, min, max), _)| {
+                    .filter(|(&(e, min, max), _)| {
                         e == cur && min <= st.confirmed_txid + 1 && max > st.confirmed_txid
                     })
                     .map(|(k, b)| (*k, b.verdict))
+                    .collect();
+                cands
+                    .iter()
+                    .filter(|(_, v)| *v == Verdict::Confirmed)
+                    .max_by_key(|(k, _)| k.2)
+                    .or_else(|| cands.iter().find(|(_, v)| *v == Verdict::Pending))
+                    .or_else(|| cands.first())
+                    .copied()
             });
             match (next, opener) {
                 (Some((k, Verdict::Confirmed)), _) => {
@@ -782,18 +912,18 @@ impl Pipeline {
                     cur,
                     new_epoch,
                     intermediate = e,
-                    "paged cut belongs to an intermediate epoch; resync needed"
+                    "paged cut belongs to an intermediate epoch; resyncing"
                 );
-                return Ok(false);
+                return self.resync_head(cell).await;
             }
         }
         let confirmed = self.cells[cell].confirmed_txid;
         if cut < confirmed {
             warn!(
                 cell,
-                cut, confirmed, "paged cut below the confirmed point; resync needed"
+                cut, confirmed, "paged cut below the confirmed point; resyncing"
             );
-            return Ok(false);
+            return self.resync_head(cell).await;
         }
         // Apply the current epoch's units up to the cut (history whatever
         // their verdict), then drop everything above it (phantoms).
@@ -847,6 +977,13 @@ impl Pipeline {
     /// fetch includes its base (an object starting at TXID 1). Source 2:
     /// live bundles.
     async fn fill_gap(&mut self, cell: &str) -> Result<()> {
+        // A cell seen for the first time (cdcell's first start against a
+        // deployment, a lost checkpoint): bootstrap along the owner's restore
+        // chain. Its epoch can be paged (no TXID-1 object of its own) and its
+        // older epochs' objects cannot be confirmed by own.json any more.
+        if self.cells[cell].epoch.is_none() && self.resync_head(cell).await? {
+            return Ok(());
+        }
         crate::metrics::inc(&crate::metrics::M.confirm_reads);
         let own_epoch = self
             .read_json(&format!("cells/{cell}/own.json"))
@@ -909,14 +1046,20 @@ impl Pipeline {
     /// GET + decode LTX objects, 16 at a time (catch-up of a whole fleet's
     /// cells must not proceed one object at a time).
     async fn fetch_units(&self, keys: Vec<String>) -> Result<Vec<Unit>> {
+        Ok(self.fetch_keyed(keys).await?.into_values().collect())
+    }
+
+    /// Like [`Self::fetch_units`], keyed by object key; objects gone since
+    /// the listing are absent.
+    async fn fetch_keyed(&self, keys: Vec<String>) -> Result<HashMap<String, Unit>> {
         use futures::StreamExt;
         let src = self.src.clone();
-        let results: Vec<Result<Option<Unit>>> = futures::stream::iter(keys)
+        let results: Vec<Result<Option<(String, Unit)>>> = futures::stream::iter(keys)
             .map(|k| {
                 let src = src.clone();
                 async move {
                     Ok(match src.get(&k).await? {
-                        Some(body) => Some(cdcell_core::ltx::decode_file(&body)?),
+                        Some(body) => Some((k, cdcell_core::ltx::decode_file(&body)?)),
                         None => None,
                     })
                 }
@@ -924,10 +1067,10 @@ impl Pipeline {
             .buffer_unordered(16)
             .collect()
             .await;
-        let mut out = Vec::new();
+        let mut out = HashMap::new();
         for r in results {
-            if let Some(u) = r? {
-                out.push(u);
+            if let Some((k, u)) = r? {
+                out.insert(k, u);
             }
         }
         Ok(out)
@@ -1383,6 +1526,25 @@ impl Pipeline {
             None => None,
         })
     }
+}
+
+/// A unit's pages (up to its commit) as a database image.
+fn image_of(u: &Unit) -> Vec<u8> {
+    let page_size = u.page_size as usize;
+    let pages: HashMap<u32, Vec<u8>> = u
+        .pages
+        .iter()
+        .filter(|(p, _)| *p <= u.commit)
+        .map(|(p, d)| (*p, d.clone()))
+        .collect();
+    let usable = page_size - usize::from(pages.get(&1).map_or(0, |p| p[20]));
+    cdcell_core::btree::Pages {
+        page_size,
+        usable,
+        commit: u.commit,
+        pages,
+    }
+    .to_image()
 }
 
 static TEST_CLOCK: std::sync::OnceLock<(i64, Instant)> = std::sync::OnceLock::new();
