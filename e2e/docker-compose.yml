@@ -1,0 +1,219 @@
+# cdcell end-to-end stack.
+#   phase 1: a 3-node celld fleet on its own MinIO, bucket notifications into
+#            NATS JetStream, toxiproxy for fault injection.
+#   phase 2: the customer side: Lakekeeper (Iceberg REST catalog) on Postgres,
+#            a separate MinIO for the CDC warehouse, ClickHouse to query it.
+#
+# Host ports (chosen not to clash with a celld/MinIO already on :8080/:9000):
+#   8180  load balancer in front of the fleet (Worker traffic)
+#   8181-8183  celld-a/b/c directly (tests use these to pick the node)
+#   9100  source MinIO S3 API     9101  source MinIO console
+#   4222  NATS                    8222  NATS monitoring
+#   9200  CDC MinIO S3 API        9201  CDC MinIO console
+#   8281  Lakekeeper (REST catalog + management API, UI at /ui)
+#   8123  ClickHouse HTTP         9900  ClickHouse native
+#
+# Start with scripts/up.sh, which also deploys the demo Worker and wires
+# the notifications. Images:
+#   CELLD_IMAGE  built from the celld repo's Dockerfile (default below)
+#   minio        built from ./minio (MinIO no longer ships prebuilt images)
+
+name: cdcell-e2e
+
+x-celld: &celld
+  image: ${CELLD_IMAGE:-celld-cdc/celld:v0.6.3}
+  restart: on-failure          # a self-fenced node exits 3; restart it like a supervisor would
+  depends_on:
+    minio:
+      condition: service_healthy
+  environment: &celld-env
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    CELLD_WATCH: /var/lib/celld/state
+  networks: [fleet]
+
+services:
+  minio:
+    build: ./minio
+    image: cdcell-e2e/minio:local
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9100:9000", "9101:9001"]
+    volumes: ["minio-src:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+    networks: [fleet]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports: ["4222:4222", "8222:8222"]
+    volumes: ["nats-data:/data"]
+    networks: [fleet]
+
+  celld-a:
+    <<: *celld
+    hostname: celld-a
+    environment: { <<: *celld-env, CELLD_NODE: celld-a }
+    depends_on:
+      minio: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    command:
+      - --bucket
+      - s3://celld
+      - --endpoint
+      - http://toxiproxy:9011
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+      - --internal-listen
+      - 0.0.0.0:8081
+      - --advertise
+      - celld-a:8081
+    ports: ["8181:8080"]   # direct access, bypassing the load balancer
+    volumes: ["celld-a:/var/lib/celld"]
+
+  celld-b:
+    <<: *celld
+    hostname: celld-b
+    environment: { <<: *celld-env, CELLD_NODE: celld-b }
+    depends_on:
+      minio: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    command:
+      - --bucket
+      - s3://celld
+      - --endpoint
+      - http://toxiproxy:9012
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+      - --internal-listen
+      - 0.0.0.0:8081
+      - --advertise
+      - celld-b:8081
+    ports: ["8182:8080"]   # direct access, bypassing the load balancer
+    volumes: ["celld-b:/var/lib/celld"]
+
+  celld-c:
+    <<: *celld
+    hostname: celld-c
+    environment: { <<: *celld-env, CELLD_NODE: celld-c }
+    depends_on:
+      minio: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    command:
+      - --bucket
+      - s3://celld
+      - --endpoint
+      - http://toxiproxy:9013
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+      - --internal-listen
+      - 0.0.0.0:8081
+      - --advertise
+      - celld-c:8081
+    ports: ["8183:8080"]   # direct access, bypassing the load balancer
+    volumes: ["celld-c:/var/lib/celld"]
+
+  # Every node reaches the bucket through its own toxiproxy listener, so the
+  # zombie tests can stall one node's uploads in flight.
+  toxiproxy:
+    build: ./toxiproxy
+    image: cdcell-e2e/toxiproxy:local
+    volumes: ["./toxiproxy/toxiproxy.json:/etc/toxiproxy.json:ro"]
+    networks: [fleet]
+
+  lb:
+    image: caddy:2-alpine
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro"]
+    ports: ["8180:8080"]
+    depends_on: [celld-a, celld-b, celld-c]
+    networks: [fleet]
+
+  # ---- phase 2: the customer's side ------------------------------------
+
+  minio-cdc:
+    image: cdcell-e2e/minio:local
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9200:9000", "9201:9001"]
+    volumes: ["minio-cdc:/data"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+    networks: [fleet]
+
+  lakekeeper-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes: ["lakekeeper-db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+    networks: [fleet]
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.15.0
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      LAKEKEEPER__PG_ENCRYPTION_KEY: e2e-only-not-a-secret
+      RUST_LOG: info
+    depends_on:
+      lakekeeper-db: { condition: service_healthy }
+    restart: "no"
+    networks: [fleet]
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.15.0
+    command: ["serve"]
+    environment: *lakekeeper-env
+    ports: ["8281:8181"]
+    depends_on:
+      lakekeeper-migrate: { condition: service_completed_successfully }
+      minio-cdc: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      retries: 30
+    networks: [fleet]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123", "9900:9000"]
+    volumes: ["clickhouse:/var/lib/clickhouse"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    networks: [fleet]
+
+networks:
+  fleet: {}
+
+volumes:
+  minio-src: {}
+  nats-data: {}
+  celld-a: {}
+  celld-b: {}
+  celld-c: {}
+  minio-cdc: {}
+  lakekeeper-db: {}
+  clickhouse: {}

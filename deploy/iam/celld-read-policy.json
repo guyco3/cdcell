@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWhatCdcellNeeds",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::celld/cells/*",
+        "arn:aws:s3:::celld/log/*",
+        "arn:aws:s3:::celld/nodes/*",
+        "arn:aws:s3:::celld/deploy/current.json"
+      ]
+    },
+    {
+      "Sid": "ListOnlyCellAndLogPrefixes",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::celld"],
+      "Condition": { "StringLike": { "s3:prefix": ["cells/*", "log/*", "log/"] } }
+    },
+    {
+      "Sid": "NeverReadSecretsCodeOrAppData",
+      "Effect": "Deny",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::celld/fleet/*",
+        "arn:aws:s3:::celld/r2/*",
+        "arn:aws:s3:::celld/kv/*",
+        "arn:aws:s3:::celld/deploy/*/*"
+      ]
+    }
+  ]
+}

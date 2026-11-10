@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# celld's LTX crate: decoding, bundles, epoch chains. Path for local
+# development next to a celld checkout; switch to the git tag for CI.
+celld-ltx = { path = "../celld/crates/ltx", default-features = false }
+# Must match celld-ltx's rusqlite (0.31): libsqlite3-sys links one SQLite.
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
