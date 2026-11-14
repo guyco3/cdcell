@@ -66,17 +66,27 @@ shard splits without moving cells between unrelated partitions
 |---|---|---|---|
 | **Notifications** of keys created under `cells/` → queue (SQS, JetStream) | the exact new object keys | one message per celld per-cell object (not per bundle: far fewer than rev 5) | optional, recommended at scale |
 | **Live tail** | cells with not-yet-folded rows | node leases + LIST and GET of live bundles | every run in fleet mode (`CDCELL_TAIL=off` to skip) |
-| **Sweep** | every cell whose objects passed its cursor | LIST `cells/` with delimiter (1 request per 1000 cells), then per cell one LIST per level with `StartAfter` | every `CDCELL_SWEEP_EVERY` (24 h), or every run without a queue |
+| **Sweep** | every cell whose objects passed its cursor | LIST `cells/` with delimiter (1 request per 1000 cells), then per cell one LIST per level with `StartAfter` | every run without a queue; with a queue off by default (`CDCELL_SWEEP_EVERY`, e.g. `7d`, as a safety net) |
 
 - A run drains the queue first, writes the keys to `_cdcell/p<k>/dirty/<run>.json`,
   then acknowledges them, so no queue setting has to outlast a run.
-- With notifications, the planner usually needs **no LIST**: the notified
-  keys continue the cell's chain from its cursor. It LISTs only on a gap.
-- A missed notification costs freshness until the next sweep, never data:
-  the objects stay.
+- Bundles are never notified: the live tail LISTs the few live node sessions
+  each run. The queue carries per-cell objects only.
 - Why the live tail matters: in fleet mode a quiet cell that stays resident
   can keep fewer than a fold's captures in bundles until it is evicted, so
   per-cell objects alone give it no freshness bound.
+
+**Late, lost and out-of-order notifications.** Every capture's content is in
+the bucket (first a bundle row, then inside a per-cell object), even though a
+TXID does not keep a file of its own once folded. The rules:
+
+| Case | Handling |
+|---|---|
+| Out of order | Keys are sorted per cell by `(epoch, min)` before planning; arrival order never matters. |
+| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. It LISTs the cell from the cursor (one request), finds the object, and continues in the same run. |
+| Missing at the end (queue has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
+| Late, after a LIST already covered it | At or below the cursor: ignored. |
+| Lost, and it was the cell's only notification | Undetectable from the queue: the cell catches up on its next write (new keys or tail rows, then the gap LIST). S3 delivers at least once, so this needs a broken setup (§7). The optional sweep covers it. |
 
 ### 2.2 Planning one cell
 
@@ -248,7 +258,9 @@ as a function of cells, write rate and run interval.
 3. A scheduler: cron, Kubernetes CronJob, ECS scheduled task (`cdcell run
    --once`); or one long-running `cdcell run` that repeats every
    `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
-4. Optional notifications of `cells/` keys to a queue.
+4. Optional: notifications of every object created under `cells/` to a
+   queue (at least once, as S3 delivers). With one, a lost notification is
+   a setup fault, not a cdcell bug. Without one, every run sweeps.
 
 ## 8. What carries over from the streaming code
 
