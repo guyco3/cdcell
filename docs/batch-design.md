@@ -34,6 +34,11 @@ Verified in celld's source (paths relative to the celld repo):
 A capture already merges the SQLite commits since the previous one
 (`ltx/src/wal.rs:529`), so no design can see every statement.
 
+**Run interval** is a setting: `CDCELL_RUN_INTERVAL` (default `3h`) for the
+long-running mode, or the customer's own schedule calling `cdcell run
+--once`. Shorter intervals give fresher data and, in fleet mode, more
+per-capture rows from the live tail; longer ones give fewer, larger files.
+
 ## 2. Where a run left off: cursors and partitions
 
 **The cursor is per cell: its committed `(epoch, txid)`.** A cell's units
@@ -187,7 +192,7 @@ that safe.
   table's sort order, applied when writing each file). Per-object queries
   (`__cell_id = …`) and type-1 MERGEs prune by column statistics without
   extra partitions. Engines that compact keep the order.
-- **No `bucket(__cell_id)` by default.** With hourly runs it would multiply
+- **No `bucket(__cell_id)` by default.** With runs every few hours it would multiply
   the files per run by the bucket count for little gain on sorted files.
   Enable per table (`CDCELL_BUCKETS=<table>=<n>`, applied by partition
   evolution, no rewrite) once a table writes more than ~10 GB a day or a
@@ -226,8 +231,8 @@ order. Customers' engines can do the same (`OPTIMIZE`, `rewrite_data_files`).
 Compared with revision 5:
 - no read per capture;
 - no confirmation reads every second;
-- no commit every 60 s, so 60× fewer Iceberg snapshots and files at hourly
-  runs;
+- no commit every 60 s: at the default 3 h interval, 180× fewer Iceberg
+  snapshots and files;
 - no always-on worker.
 
 `docs/cost.md` will measure this on the e2e stack (MinIO request metrics),
@@ -241,7 +246,8 @@ as a function of cells, write rate and run interval.
 2. Read access to the celld bucket; read/write to the lake bucket and the
    catalog.
 3. A scheduler: cron, Kubernetes CronJob, ECS scheduled task (`cdcell run
-   --once`); or one long-running `cdcell run --every 1h`.
+   --once`); or one long-running `cdcell run` that repeats every
+   `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
 4. Optional notifications of `cells/` keys to a queue.
 
 ## 8. What carries over from the streaming code
