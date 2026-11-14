@@ -83,7 +83,7 @@ TXID does not keep a file of its own once folded. The rules:
 | Case | Handling |
 |---|---|
 | Out of order | Keys are sorted per cell by `(epoch, min)` before planning; arrival order never matters. |
-| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. It LISTs the cell from the cursor (one request), finds the object, and continues in the same run. |
+| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. It LISTs the cell from the cursor (one request), finds the object, and continues in the same run. (Optimization, later: a single-epoch gap usually is one object whose key is known up to its level, so GET the L1 and L0 guesses first, ~12× cheaper than a LIST; LIST on a 404, a multi-object gap or an epoch change.) |
 | Missing at the end (queue has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
 | Lost, and it was the cell's only notification | Undetectable from the queue: the cell catches up on its next write (new keys or tail rows, then the gap LIST). S3 delivers at least once, so this needs a broken setup (§7). The optional sweep covers it. |
