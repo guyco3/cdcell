@@ -62,19 +62,50 @@ shard splits without moving cells between unrelated partitions
 
 ### 2.1 Finding the cells to process ("dirty cells")
 
+The queue is the only discovery mechanism. celld's bucket sends a
+notification for every object created under `cells/` and under `log/` to a
+queue (SQS or JetStream), at least once (§7).
+
 | Source | What it gives | Cost | When |
 |---|---|---|---|
-| **Notifications** of keys created under `cells/` → queue (SQS, JetStream) | the exact new object keys | one message per celld per-cell object (not per bundle: far fewer than rev 5) | optional, recommended at scale |
-| **Live tail** | cells with not-yet-folded rows | node leases + LIST and GET of live bundles | every run in fleet mode (`CDCELL_TAIL=off` to skip) |
-| **Sweep** | every cell whose objects passed its cursor | LIST `cells/` with delimiter (1 request per 1000 cells), then per cell one LIST per level with `StartAfter` | every run without a queue; with a queue off by default (`CDCELL_SWEEP_EVERY`, e.g. `7d`, as a safety net) |
+| **Per-cell notifications** (`cells/`) | the exact new per-cell object keys | one message per celld per-cell object | every run |
+| **Bundle notifications** (`log/`) for the live tail | bundle keys with not-yet-folded rows | one message and one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s), most of them 404 by run time; plus node lease GETs | every run in fleet mode (`CDCELL_TAIL=off` skips bundles; bundle notifications are then not needed) |
 
 - A run drains the queue first, writes the keys to `_cdcell/p<k>/dirty/<run>.json`,
   then acknowledges them, so no queue setting has to outlast a run.
-- Bundles are never notified: the live tail LISTs the few live node sessions
-  each run. The queue carries per-cell objects only.
+- The live tail GETs the queued bundle keys. A 404 means celld already
+  covered and GC'd that bundle; its rows are in per-cell objects, which are
+  notified too, so a 404 is fine. Node leases are still read (GET) for
+  confirmation (§2.2).
 - Why the live tail matters: in fleet mode a quiet cell that stays resident
   can keep fewer than a fold's captures in bundles until it is evicted, so
   per-cell objects alone give it no freshness bound.
+- Cells that existed before cdcell was deployed and never write again are
+  not exported: no notification ever names them. A one-time, operator-run
+  `cdcell backfill` is planned (§10); it is a manual command, not part of runs.
+
+**When cdcell LISTs.** In exactly one case: **the queued keys for a cell do
+not form an unbroken sequence from what cdcell already has** (its cursor and
+cell state). Then, and only then, cdcell LISTs that one cell's prefix from
+its cursor (`cells/<cell>/ltx/` with delimiter for epochs ≥ E, then per
+level `StartAfter = <t+1 hex>`). This one rule covers:
+
+- a missing key in the middle of a run's keys (late or lost notification);
+- a cell seen for the first time whose first queued object is not a full
+  image (L9, or a TXID-1/full-image opener): the cell has nothing yet, so its
+  base is missing (bootstrap);
+- a cell whose saved cell snapshot is missing, so its state must be rebuilt
+  from celld's newest full image;
+- an epoch change whose opener or intermediate epochs are not all in the
+  queue;
+- the fallback resync after celld's epoch GC.
+
+Optimization: a single-epoch gap usually is one object whose key is known up
+to its level, so first GET the guessed L1, then L0 key, ~12× cheaper than a
+LIST. LIST on a 404, a multi-object gap or an epoch change.
+
+There is no other LIST anywhere: no sweep, no daily job, no LIST of bundles
+or live sessions.
 
 **Late, lost and out-of-order notifications.** Every capture's content is in
 the bucket (first a bundle row, then inside a per-cell object), even though a
@@ -83,16 +114,16 @@ TXID does not keep a file of its own once folded. The rules:
 | Case | Handling |
 |---|---|
 | Out of order | Keys are sorted per cell by `(epoch, min)` before planning; arrival order never matters. |
-| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. It LISTs the cell from the cursor (one request), finds the object, and continues in the same run. (Optimization, later: a single-epoch gap usually is one object whose key is known up to its level, so GET the L1 and L0 guesses first, ~12× cheaper than a LIST; LIST on a 404, a multi-object gap or an epoch change.) |
+| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. The gap rule applies (GET guesses, else LIST the cell from the cursor); it finds the object and continues in the same run. |
 | Missing at the end (queue has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
-| Lost, and it was the cell's only notification | Undetectable from the queue: the cell catches up on its next write (new keys or tail rows, then the gap LIST). S3 delivers at least once, so this needs a broken setup (§7). The optional sweep covers it. |
+| Lost, and it was the cell's only notification | The cell catches up on its next write: its next notified key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§7). |
 
 ### 2.2 Planning one cell
 
-Inputs: cursor `(E, t)`; the cell's objects past it (notified or LISTed:
-`cells/<cell>/ltx/` with delimiter for epochs ≥ E, then per level
-`StartAfter = <t+1 hex>`); its live bundle rows.
+Inputs: cursor `(E, t)`; the cell's objects past it, from the queue (a
+LIST only under the gap rule of §2.1); its live bundle rows (queued bundle
+keys that still exist).
 
 1. **GET** the units the plan needs (step 3), **then read `own.json`** and
    the node leases of bundle rows. That order is the confirmation rule
@@ -234,8 +265,8 @@ order. Customers' engines can do the same (`OPTIMIZE`, `rewrite_data_files`).
 
 | Item | Requests |
 |---|---|
-| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a snapshot PUT only when §2.3 requires one; a LIST only on gaps or sweeps |
-| Per run | node leases and live bundles (fleet); the queue drain; one fence commit per partition |
+| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a snapshot PUT only when §2.3 requires one; a LIST only in the gap fallback (§2.1) |
+| Per run | the queue drain; node lease GETs and one GET per queued bundle key, most 404 (fleet); one fence commit per partition |
 | Per batch | a few catalog calls; one Parquet file per (table, day) |
 
 Compared with revision 5:
@@ -258,9 +289,10 @@ as a function of cells, write rate and run interval.
 3. A scheduler: cron, Kubernetes CronJob, ECS scheduled task (`cdcell run
    --once`); or one long-running `cdcell run` that repeats every
    `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
-4. Optional: notifications of every object created under `cells/` to a
-   queue (at least once, as S3 delivers). With one, a lost notification is
-   a setup fault, not a cdcell bug. Without one, every run sweeps.
+4. Required: notifications of every object created under `cells/` and
+   under `log/` (bundles) to a queue (SQS or JetStream), at least once, as
+   S3 delivers. `log/` is not needed with `CDCELL_TAIL=off`. A lost
+   notification is a setup fault (a client invariant), not a cdcell bug.
 
 ## 8. What carries over from the streaming code
 
@@ -269,7 +301,7 @@ as a function of cells, write rate and run interval.
 | decoder (`cdcell-core`), emit, schema registry and evolution, `iceberg_out` staging and atomic commit, restore-chain planning (`resync::plan_chain`), resync fallback, keys, metrics, IAM policy, maintain | `pipeline.rs` streaming state machine, `run.rs` intake loop, gap timers, in-memory parking, JetStream ack handling |
 
 The test kit (fake celld with real SQLite and LTX, `MemSink`, paused time)
-carries over: tests call `run_once` instead of delivering notifications.
+carries over: tests queue notifications, then call `run_once`.
 
 ## 9. To verify before building
 
@@ -282,3 +314,9 @@ carries over: tests call `run_once` instead of delivering notifications.
 4. The finest-chain planner against every overlap celld produces (merged
    drain L0s, L1s from the bundle overlay, recovery windows): property test
    in the test kit.
+
+## 10. Planned
+
+- `cdcell backfill`: a one-time command the operator runs at
+  install. It LISTs `cells/` once and exports cells that existed before
+  cdcell and never write again. It is a manual command, not part of runs.
