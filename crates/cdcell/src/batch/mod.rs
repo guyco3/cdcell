@@ -8,3 +8,5 @@
 
 pub mod chain;
 pub mod obj;
+pub mod partition;
+pub mod plan;
