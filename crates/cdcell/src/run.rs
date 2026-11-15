@@ -1,7 +1,9 @@
 //! `cdcell run`: notifications → pipeline → Iceberg (design §3).
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer::pull, AckKind};
@@ -9,7 +11,7 @@ use futures::StreamExt;
 use tracing::{info, warn};
 
 use crate::keys::{self, ObjKey};
-use crate::pipeline::{MsgId, Origin, Pipeline, Settings, UnitIn};
+use crate::pipeline::{MsgId, Pipeline, Settings, UnitIn};
 use crate::source::Store;
 
 pub struct Config {
@@ -125,7 +127,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut pipe = Pipeline::new(
         src.clone(),
         state,
-        sink,
+        Box::new(sink),
         Settings {
             script: script.clone(),
             gap_timeout: cfg.gap_timeout,
@@ -205,15 +207,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             } else {
                 keys_of(&msg.payload, &cfg.source_prefix)
                     .into_iter()
-                    .map(|k| {
-                        let p = keys::parse(&k);
-                        (k, p)
-                    })
-                    .filter(|(k, p)| match p {
-                        ObjKey::Ltx { level: 0, .. } => true,
-                        ObjKey::Bundle { .. } => pipe.mark_bundle(k), // false: already read by reconciliation
-                        _ => false, // own.json, L1/L9, recovery hints: no unit
-                    })
+                    .filter_map(|k| crate::intake::wanted(&mut pipe, &k).map(|p| (k, p)))
                     .collect()
             };
             fetched.push((id, keys));
@@ -227,55 +221,10 @@ pub async fn run(cfg: Config) -> Result<()> {
                 let src = src.clone();
                 async move {
                     let got_at = Instant::now();
-                    let body = src.get(&key).await?;
-                    let mut units = Vec::new();
-                    let Some(body) = body else {
-                        return anyhow::Ok((id, units));
+                    let units = match src.get(&key).await? {
+                        Some(body) => crate::intake::units(&key, parsed, &body, Some(id), got_at),
+                        None => Vec::new(),
                     };
-                    match parsed {
-                        ObjKey::Ltx { cell, epoch, .. } => {
-                            match cdcell_core::ltx::decode_file(&body) {
-                                Ok(unit) => units.push(UnitIn {
-                                    cell,
-                                    epoch,
-                                    unit,
-                                    origin: Origin::Cell,
-                                    msg: Some(id),
-                                    got_at,
-                                    bootstrap: false,
-                                }),
-                                Err(e) => {
-                                    crate::metrics::inc(&crate::metrics::M.decode_errors);
-                                    warn!(key, %e, "undecodable LTX object")
-                                }
-                            }
-                        }
-                        ObjKey::Bundle {
-                            node,
-                            generation,
-                            log_epoch,
-                            ..
-                        } => match cdcell_core::ltx::decode_bundle(&body) {
-                            Ok(rows) => units.extend(rows.into_iter().map(|r| UnitIn {
-                                cell: r.cell,
-                                epoch: r.cell_epoch,
-                                unit: r.unit,
-                                origin: Origin::Bundle {
-                                    node: node.clone(),
-                                    generation: generation.clone(),
-                                    log_epoch,
-                                },
-                                msg: Some(id),
-                                got_at,
-                                bootstrap: false,
-                            })),
-                            Err(e) => {
-                                crate::metrics::inc(&crate::metrics::M.decode_errors);
-                                warn!(key, %e, "undecodable bundle")
-                            }
-                        },
-                        _ => {}
-                    }
                     anyhow::Ok((id, units))
                 }
             })

@@ -30,6 +30,8 @@ x-celld: &celld
     AWS_ACCESS_KEY_ID: minioadmin
     AWS_SECRET_ACCESS_KEY: minioadmin
     CELLD_WATCH: /var/lib/celld/state
+    # epoch GC (off unless a test sets it; see tests/m5-epoch-gc.sh)
+    CELLD_LTX_RETENTION_SECS: ${CELLD_LTX_RETENTION_SECS:-0}
   networks: [fleet]
 
 services:

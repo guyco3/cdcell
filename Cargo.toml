@@ -13,3 +13,11 @@ celld-ltx = { path = "../celld/crates/ltx", default-features = false }
 # Must match celld-ltx's rusqlite (0.31): libsqlite3-sys links one SQLite.
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1"
+
+# Linking full debug info for arrow/iceberg/aws-lc needs more memory than a
+# small build VM has: keep line tables (backtraces) for our code only.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

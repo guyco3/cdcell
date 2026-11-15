@@ -50,7 +50,7 @@ pub fn parse(key: &str) -> ObjKey {
         }
         if let Some((cell, tail)) = rest.split_once("/ltx/") {
             if cell.contains("/facets/") {
-                return ObjKey::Other; // facets deferred in v1 (design §9)
+                return ObjKey::Other; // facets deferred in v1 (design §10)
             }
             let parts: Vec<&str> = tail.split('/').collect();
             if let [e, level, name] = parts[..] {

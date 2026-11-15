@@ -11,7 +11,7 @@ snaps() { curl -s "http://127.0.0.1:8281/catalog/v1/$P/namespaces/cdcell%1Fshop%
 read -r before prop <<<"$(snaps)"
 [ "$prop" = "true" ] || fail "write.metadata.delete-after-commit.enabled is $prop"
 [ "$before" -gt 3 ] || fail "need >3 snapshots to test expiry, have $before"
-docker run --rm --network "$NET" -v "$TARGET_VOL:/t" celld-cdc/rust-dev:1.98.1 "$CDCELL_BIN" maintain --retain-last 2 --older-than-s 0 \
+docker run --rm --network "$NET" -v "$TARGET_VOL:/t" cdcell/rust-dev:1.98.1 "$CDCELL_BIN" maintain --retain-last 2 --older-than-s 0 \
   || fail "cdcell maintain failed"
 read -r after _ <<<"$(snaps)"
 [ "$after" -le 2 ] || fail "snapshots after maintain: $after (want <= 2, had $before)"

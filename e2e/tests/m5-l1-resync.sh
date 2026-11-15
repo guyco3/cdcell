@@ -24,4 +24,4 @@ start_cdcell
 wait_caught_up
 docker logs cdcell-run 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "resynced|rebuilt" | cut -c1-220
 docker logs cdcell-run 2>&1 | grep -q "resynced from a later full image" || fail "no resync from a later image (scenario not reproduced?)"
-python3 -I tools/verify_type1.py --shops "$SHOP" --allow-dups && echo "m5-l1-resync: PASS"
+verify_eventually --shops "$SHOP" --allow-dups && echo "m5-l1-resync: PASS"

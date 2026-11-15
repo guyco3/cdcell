@@ -1,14 +1,6 @@
 //! cdcell: CDC from celld Durable Objects to Iceberg.
 
-mod capture;
-mod emit;
-mod iceberg_out;
-mod keys;
-mod metrics;
-mod pipeline;
-mod resync;
-mod run;
-mod source;
+use cdcell::{emit, iceberg_out, run};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -109,7 +101,7 @@ async fn main() -> Result<()> {
             selftest_fixture(dir, &flag("--catalog", "http://lakekeeper:8181/catalog"), &flag("--warehouse", "cdc"), &flag("--script", "shop")).await
         }
         Some("maintain") => {
-            // design §8: expire snapshots of every cdcell table
+            // design §9: expire snapshots of every cdcell table
             let sink = iceberg_out::Sink::connect(&flag("--catalog", "http://lakekeeper:8181/catalog"), &flag("--warehouse", "cdc")).await?;
             let retain: usize = flag("--retain-last", "100").parse()?;
             let older_s: i64 = flag("--older-than-s", &(7 * 24 * 3600).to_string()).parse()?;

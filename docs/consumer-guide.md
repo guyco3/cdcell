@@ -42,14 +42,18 @@ Sets and binary are tagged: `{"$date": …}`, `{"$bigint": "…"}`, `{"$map": [�
 2. **Key = `(__cell_id, __key)`.** Primary keys repeat across Durable Objects
    (every shop has an order 1).
 3. **Deletes are rows** with `__op = 'd'`. A key whose latest row is a delete
-   does not exist.
+   does not exist. `DROP TABLE` emits a delete for every row of the table, and
+   `ALTER TABLE ... RENAME TO` a delete under the old name plus a create
+   under the new one, so per-table current state stays exact.
 4. **Duplicates can appear after a cdcell crash.** They have the same
    `(__cell_id, __key, __epoch, __txid)`; merge with a version guard (below)
    or deduplicate on those four columns.
-5. **A long cdcell outage can collapse history.** If celld compacted a
-   Durable Object's history while cdcell was down, cdcell emits one net
-   change (updates plus deletes) at the compacted point. Current state stays
-   exact; versions inside that window are missing from type 2.
+5. **History is per transaction while cdcell keeps up.** If cdcell falls
+   behind celld's compaction window (an outage, a backlog), it emits one net
+   change (updates plus deletes) per compacted range. Current state stays
+   exact; versions inside that range are missing from type 2. Operators can
+   widen the window with celld's `CELLD_LTX_COMPACTION_MIN_TXIDS` /
+   `_MIN_MB` (design §7, operating requirements).
 6. **NULLs are values.** A row re-created with NULL columns must not pick up
    older non-NULL values. In ClickHouse, `argMax(col, v)` skips NULLs: use
    `argMax(tuple(col), v).1` (or `argMax(tuple(*), v)`).

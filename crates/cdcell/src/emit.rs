@@ -93,7 +93,7 @@ pub fn fingerprint(info: &TableInfo) -> String {
 
 /// SQLite value → typed column value, or `None` when it does not fit the
 /// column's affinity (it then goes to `__raw`, design §2).
-fn typed(v: &Value, aff: Affinity) -> Option<OutValue> {
+pub(crate) fn typed(v: &Value, aff: Affinity) -> Option<OutValue> {
     const EXACT: i64 = 1 << 53;
     Some(match (aff, v) {
         (_, Value::Null) => OutValue::Null,

@@ -39,7 +39,7 @@ v1 in progress on branch `v1-foundation`. Milestones:
 | M6 | Operations: metrics, maintenance, IAM, soak | ⏳ metrics/maintenance/IAM ✅, 60-minute soak not yet run |
 
 Details, deviations from the design, and open items:
-[`docs/design.md` §9](docs/design.md).
+[`docs/design.md` §10](docs/design.md).
 
 ## Layout
 
@@ -57,8 +57,8 @@ Details, deviations from the design, and open items:
 
 The Rust workspace depends on celld's `celld-ltx` crate by path
 (`../celld/crates/ltx`), so check out celld next to this repo. Builds run in a
-container (`scripts/cargo.sh`, image `celld-cdc/rust-dev:1.98.1`, built from
-the celld repo's Dockerfile `build` stage):
+container (`scripts/cargo.sh`: celld's Rust version plus clippy/rustfmt,
+`scripts/rust-dev.Dockerfile`, built automatically on first use):
 
 ```sh
 scripts/cargo.sh build -p cdcell
@@ -73,7 +73,7 @@ cdcell maintain     # expire snapshots, set metadata-cleanup properties on cdcel
 ```
 
 Prometheus metrics on `:9464` (`cdcell_watermark_age_seconds_p99`,
-`cdcell_parked_cells`, `cdcell_s3_requests_total{op}`, …; design §8).
+`cdcell_parked_cells`, `cdcell_s3_requests_total{op}`, …; design §9).
 
 ## Development
 

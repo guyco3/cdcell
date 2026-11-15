@@ -1,4 +1,4 @@
-//! Prometheus metrics (design §8), served on :9464.
+//! Prometheus metrics (design §9), served on :9464.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
