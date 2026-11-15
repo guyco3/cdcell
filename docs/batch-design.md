@@ -103,9 +103,10 @@ shards and pending sets.
 
 ### 2.1 Finding the cells to process ("dirty cells")
 
-The queue is the only discovery mechanism. celld's bucket sends a
-notification for every object created under `cells/` and under `log/` to a
-queue (SQS or JetStream), at least once (§8). Rules filter to `.ltx` and
+A **message broker** is the only discovery mechanism. celld's bucket sends a
+notification for every object created under `cells/` and under `log/` to the
+broker (SQS, Kafka, JetStream, …; any works, §7), at least once (§8).
+Ordering is not required: keys are sorted per cell before planning. Rules filter to `.ltx` and
 `.ltxb` keys (G5); anything else that slips through (`own.json`,
 `retired.json`) is dropped.
 
@@ -114,8 +115,8 @@ queue (SQS or JetStream), at least once (§8). Rules filter to `.ltx` and
 | **Per-cell notifications** (`cells/`) | the exact new per-cell object keys | one message per celld per-cell object | every run |
 | **Bundle notifications** (`log/`) for the live tail | bundle keys with not-yet-folded rows | one message and one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s), most of them 404 by run time; plus node lease GETs | every run in fleet mode (`CDCELL_TAIL=off` skips bundles; bundle notifications are then not needed) |
 
-- A run drains the queue once, splits the keys by partition, writes them
-  to `_cdcell/p<k>/dirty/<run>.json`, then acknowledges them, so no queue
+- A run drains the broker once, splits the keys by partition, writes them
+  to `_cdcell/p<k>/dirty/<run>.json`, then acknowledges them, so no broker
   setting has to outlast a run. Each partition's work is its dirty list
   plus its pending set.
 - Bundle keys do not say which cells they hold, so the run GETs bundles
@@ -130,15 +131,15 @@ queue (SQS or JetStream), at least once (§8). Rules filter to `.ltx` and
   not exported: no notification ever names them. A one-time, operator-run
   `cdcell backfill` is planned (§11).
 
-**When cdcell LISTs.** Only for one cell, and only when **its queued keys
+**When cdcell LISTs.** Only for one cell, and only when **its notified keys
 do not by themselves give an unbroken, provable chain** from what cdcell
 already has (cursor and cell state). This covers:
 
 - a missing key in the middle (late or lost notification);
-- a cell seen for the first time whose first queued object is not a full
+- a cell seen for the first time whose first notified object is not a full
   image (L9, or a TXID-1 opener, D15): its base is missing (bootstrap);
 - a cell whose saved state is missing, so it must be rebuilt;
-- an epoch change whose opener is not queued, or whose intermediate epochs
+- an epoch change whose opener is not notified, or whose intermediate epochs
   must be proven empty (epochs are routine, A6);
 - the fallback resync after celld's epoch GC.
 
@@ -159,7 +160,7 @@ size is a threshold).
 **Holes.** If the same gap stays open after `CDCELL_GAP_LISTS` (default 3)
 LISTs in different runs, the cell is parked (metric
 `cdcell_cell_parked{reason="hole"}`) and stops LISTing. It resumes when a
-later epoch's opener arrives in the queue, with one net change (§2.2).
+later epoch's opener arrives in the broker, with one net change (§2.2).
 
 **Late, lost and out-of-order notifications.** Every capture's content is in
 the bucket (first a bundle row, then inside a per-cell object), even though a
@@ -168,15 +169,15 @@ TXID does not keep a file of its own once folded.
 | Case | Handling |
 |---|---|
 | Out of order | Keys are sorted per cell by `(epoch, min)` before planning; arrival order never matters. |
-| Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. The LIST rule applies and the run continues with what it finds. |
-| Missing at the end (queue has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
+| Missing in the middle (cursor 299; broker has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. The LIST rule applies and the run continues with what it finds. |
+| Missing at the end (broker has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
 | Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§8). |
 | Owner restarted into a snapshot epoch before the run read the old tail | The old epoch's unproven tail and the new epoch's first writes become one net change at the opener (§4). |
 
 ### 2.2 Planning one cell
 
-Inputs: cursor `(E, t)`; the cell's objects past it (queue, or a LIST under
+Inputs: cursor `(E, t)`; the cell's objects past it (broker, or a LIST under
 §2.1); its live bundle rows from the run's split.
 
 1. **GET** the units the plan needs (step 3), **then read `own.json`** and
@@ -256,7 +257,7 @@ property, last writer wins) would race too.
    holder commits an empty snapshot to the fence branch (§3.4) and
    remembers its id.
 2. **Roll forward** any batch committed after the last checkpoint (§3.3).
-3. **Drain** the queue and split bundles (§2.1). Record `planned_at` and the
+3. **Drain** the broker and split bundles (§2.1). Record `planned_at` and the
    batch seq in `_cdcell/batches/<seq>.json` (create-only).
 4. **Process partitions concurrently:** plan, GET, confirm, apply, decode;
    write journals and snapshots; stage Parquet at deterministic paths
@@ -280,14 +281,14 @@ Each Durable Object's work needs only its own objects: a 1:1 map, no joins
 or shuffles. So a run splits into three steps any runner can execute:
 
 ```
-cdcell plan                 lease, fence, roll forward, drain the queue, split bundles;
+cdcell plan                 lease, fence, roll forward, drain the broker, split bundles;
                             writes the run plan: batch seq, planned_at, partitions → tasks
 cdcell stage --task <i>     N in parallel: decode the task's partitions, write cell state
                             and Parquet, write p<k>.json per partition (staged files)
 cdcell commit               read every p<k>.json; one atomic commit with the fence
 ```
 
-- **Only `plan` reads the queue.** It drains it with concurrent pollers,
+- **Only `plan` reads the broker.** It drains it with concurrent pollers,
   writes the keys per partition (`_cdcell/runs/<seq>/p<k>/keys.json`), GETs
   and splits bundles into per-partition row files (a bundle mixes cells of
   many partitions, so this happens once, centrally), and acknowledges the
@@ -296,11 +297,11 @@ cdcell commit               read every p<k>.json; one atomic commit with the fen
   visibility timeout or ack deadline spanning a run, no ordering needed.
   Files of a failed run stay as the pending set; the next `plan` merges
   them with new messages.
-- **Customers do not partition their queue.** S3 notifications filter only
-  by prefix/suffix (no hashing), so one ordinary queue receives everything
-  and `plan` does the partitioning. The queue carries folds and bundles,
+- **Customers do not partition their broker.** S3 notifications filter only
+  by prefix/suffix (no hashing), so one ordinary broker receives everything
+  and `plan` does the partitioning. The broker carries folds and bundles,
   not captures, so one drainer keeps up; if it ever does not, `plan` runs
-  several pollers on the same queue (SQS and JetStream allow concurrent
+  several pollers on the same broker (SQS and JetStream allow concurrent
   consumers). A Kafka/Kinesis adapter whose topic is keyed by cell id
   (customer-routed) could let stage tasks read their own partitions; later.
 - One machine: `cdcell run` does all three, partitions as threads (default).
@@ -445,7 +446,7 @@ commit; the run retries (§3.3).
 |---|---|
 | Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a journal PUT when the cursor ends in tail rows; a snapshot PUT only per `CDCELL_SNAPSHOT_EVERY` |
 | Per LISTing cell | gap: 3 LISTs (L0, L1, L9); epoch change: 1 delimiter LIST plus 3 per walked epoch. Epoch changes are routine (A6), so expect this for cells restarted since the last run |
-| Per run | the queue drain; one GET per queued bundle key, most 404, split centrally (fleet); node lease GETs; one lease write; one catalog transaction (or a few for a huge run) |
+| Per run | the broker drain; one GET per notified bundle key, most 404, split centrally (fleet); node lease GETs; one lease write; one catalog transaction (or a few for a huge run) |
 | Per batch | one Parquet file per (table, day) |
 
 Compared with revision 5:
@@ -473,16 +474,16 @@ is not tied to one vendor:
 | Scheduler | runs a container on a schedule | Kubernetes CronJob, ECS scheduled task, Cloud Run jobs, Nomad periodic job, cron on a VM, a task in Airflow / Dagster / Argo |
 | celld bucket, lake bucket, state prefix | S3 API | AWS S3, MinIO, Cloudflare R2, GCS (S3 interoperability) |
 | Catalog | Iceberg REST catalog spec | Lakekeeper, Apache Polaris, Nessie, AWS Glue (REST endpoint), S3 Tables, Unity Catalog, Snowflake Open Catalog |
-| Queue | a small adapter | SQS, NATS JetStream; others (Kafka, Pub/Sub) are an adapter each |
+| Message broker | a small adapter | SQS, NATS JetStream; others (Kafka, Pub/Sub) are an adapter each |
 | Consumers | Iceberg tables | Spark, Trino, ClickHouse, DuckDB, Snowflake, BigQuery (BigLake), Athena, Flink |
 
-**Any queue works** if notifications can get into it and cdcell has a reader
+**Any message broker works** if notifications can get into it and cdcell has a reader
 for it: cdcell only needs at-least-once delivery, retention longer than the
 longest outage, and read-then-acknowledge. Customers choose; a forwarder
 (a function, a webhook, a connector) can bridge any storage provider to any
-queue. Recommended setups that need no forwarder:
+broker. Recommended setups that need no forwarder:
 
-| celld bucket on | Native notification targets | Recommended queue |
+| celld bucket on | Native notification targets | Recommended broker |
 |---|---|---|
 | AWS S3 | SQS, SNS, Lambda, EventBridge | SQS (Kafka/MSK would need a forwarder) |
 | MinIO | Kafka, NATS JetStream, AMQP, Redis, MQTT, webhooks, … | Kafka or JetStream |
@@ -512,11 +513,11 @@ Engines such as Spark belong on the consumer side, if the customer has one
    --once`); or one long-running `cdcell run` that repeats every
    `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
 4. Required: notifications of every object created under `cells/` (suffix
-   `.ltx`) and under `log/` (suffix `.ltxb`) to a queue (SQS or JetStream),
+   `.ltx`) and under `log/` (suffix `.ltxb`) to a message broker (SQS or JetStream),
    at least once, as S3 delivers (G2, G5). `log/` is not needed with
    `CDCELL_TAIL=off`. A lost notification is a setup fault (G3), not a
    cdcell bug.
-5. Queue retention longer than cdcell's longest outage (SQS up to 14 days;
+5. Broker retention longer than cdcell's longest outage (SQS up to 14 days;
    JetStream `max_age`). Without it, a quiet cell's final objects may never
    be exported: no later write reveals the gap.
 
@@ -530,7 +531,7 @@ Engines such as Spark belong on the consumer side, if the customer has one
 | | Rev-5 file names are random and rows unsorted: now deterministic names and sorted rows (§3.1). |
 
 The test kit (fake celld with real SQLite and LTX, `MemSink`, paused time)
-carries over: tests queue notifications, then call `run_once`.
+carries over: tests enqueue notifications, then call `run_once`.
 
 ## 10. To verify or build before shipping
 
