@@ -476,10 +476,13 @@ is not tied to one vendor:
 | Queue | a small adapter | SQS, NATS JetStream; others (Kafka, Pub/Sub) are an adapter each |
 | Consumers | Iceberg tables | Spark, Trino, ClickHouse, DuckDB, Snowflake, BigQuery (BigLake), Athena, Flink |
 
-**Queues by storage provider** (S3-style notifications must reach the queue
-natively; check the provider's current docs):
+**Any queue works** if notifications can get into it and cdcell has a reader
+for it: cdcell only needs at-least-once delivery, retention longer than the
+longest outage, and read-then-acknowledge. Customers choose; a forwarder
+(a function, a webhook, a connector) can bridge any storage provider to any
+queue. Recommended setups that need no forwarder:
 
-| celld bucket on | Native notification targets | Queue cdcell reads |
+| celld bucket on | Native notification targets | Recommended queue |
 |---|---|---|
 | AWS S3 | SQS, SNS, Lambda, EventBridge | SQS (Kafka/MSK would need a forwarder) |
 | MinIO | Kafka, NATS JetStream, AMQP, Redis, MQTT, webhooks, … | Kafka or JetStream |
