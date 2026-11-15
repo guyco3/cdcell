@@ -16,7 +16,7 @@ is not implemented in v1.
 | Restore chain | `resync.rs:109-161` `plan_chain` returns `None` when an intermediate epoch does not end at the cut; celld `ltx/src/client/epochs.rs:50-80` `continue`s (skips it), skips empty epochs (incl. the newest, `:64`), clips each epoch to `max < above.lo`, and stops at any level's `min == 1` (incl. L9) | port `EpochChain::build` exactly as a pure fn, property-tested against celld-ltx (already a dev-dep) |
 | Within-epoch path | `plan_chain` greedy max reach (`resync.rs:131-138`), like celld `calc_restore_plan` (`replica.rs:669-760`) | finest-chain DP is new: reach must equal celld's restore reach; steps ≥ |
 | Marker | `cdcell-core/src/ltx.rs:25-30` `is_paged_marker` (zero pages, `wal_size == 0`; celld `ltx/src/db.rs:961-985`) | the only way a fetched object proves a cut; keys never do (bucket-mode L0s are `n-n`) |
-| L0 straddles | celld `sync_cell` uploads one merged L0 from `replica.pos()+1` (`celld/ltx_repl.rs:4110,4150-4160`); fleet folds don't `seed_pos` | the StartAfter bound is false; full-L0 fallback (design §2.1) |
+| L0 straddles | celld `sync_cell` uploads one merged L0 from `replica.pos()+1` (`celld/ltx_repl.rs:4110,4150-4160`); fleet folds don't `seed_pos` | StartAfter only at a known L0 end or marker; full-L0 fallback (design §2.1; spike `docs/spikes/pr0.md` §1) |
 | Listing | `source.rs:77-95` `list` has no StartAfter/delimiter | add `list_after` (`list_with_offset`, results sorted), `list_dirs` (`list_with_delimiter`, paginated) |
 | File names | `iceberg_out.rs:724-735` random; rows unsorted; overwrite | `b<seq>-t<i>-NNNNN.parquet`, `PutMode::Create`; sort by `__cell_id, __key, __epoch, __txid, __op` |
 | Partition spec | hard-coded `day + bucket(16)` `iceberg_out.rs:325-332` | configurable; evolved only in `plan` (iceberg `snapshot.rs:150` rejects non-default spec ids) |
@@ -126,6 +126,14 @@ _cdcell/schemas/<ns.table>/registry.json    CAS counter, fingerprint → version
 snapshots/<urlenc(cell)>/<epoch:020>-<txid:020>.zst
 ```
 
+## Spike results (PR 0, `docs/spikes/pr0.md`)
+
+1. L0 straddles are real (drains); StartAfter is safe only at an L0 end or the paged marker; full-L0 fallback. Planner test `cursor_on_l1_start_after_uses_last_known_l0_end`. Kit: per-cell `replica_pos`, `drain_l0_from`, `fold_l1_next` (incremental, keeps L0s), `upload_recovered`, `evict_l9_then_drain`; normal captures get `wal_size > 0` so marker tests exercise both checks.
+2. Paged marker predicate = `cdcell-core/src/ltx.rs:25` `is_paged_marker` (zero pages, `wal_size == 0`); no real capture matches.
+3. Spec evolution on Lakekeeper 0.15.0: one commit with `add-spec` + `set-default-spec(-1)` + `add-sort-order` + `set-default-sort-order(-1)` under `assert-default-spec-id` / `assert-default-sort-order-id` (200); source ids from loaded metadata.
+4. DataFile JSON: spec id not in the JSON (store it); pass the staged schema or bounds drop; JSON text is not deterministic (hash file bytes, not JSON); `fast_append` requires the default spec. Pin Parquet `created_by`. Consider `check_duplicate(false)` after measuring.
+5. celld v0.6.3 has `CELLD_IDLE_EVICT_S`, `CELLD_LTX_COMPACTION_MIN_TXIDS` (min 2), `CELLD_LTX_PAGED_MIN_MB` (0 pages every chain, needs the fleet format gate), `CELLD_DURABILITY`.
+
 ## 2. PR stack (on top of `batch-design`, PR #7)
 
 ### PR 0 spikes (no product code; findings recorded here)
@@ -134,7 +142,7 @@ snapshots/<urlenc(cell)>/<epoch:020>-<txid:020>.zst
    and that StartAfter + full-L0 fallback closes every generated gap.
 2. **Marker identification:** real celld paged markers have zero pages and `wal_size == 0`; no bucket-mode
    `n-n` L0 does.
-3. **add-spec on a rev-5 table** (`add-spec`, `set-default-spec`, `replace-sort-order`) on Lakekeeper 0.15.0.
+3. **add-spec on a rev-5 table** (`add-spec`, `set-default-spec`, `add-sort-order`) on Lakekeeper 0.15.0.
 4. **DataFile JSON across processes** with an evolved schema (partition values, column stats); fallback:
    rebuild from Parquet footers.
 5. **Fence shapes: verified on Lakekeeper 0.15.0**, record only: first take `assert-ref-snapshot-id` with
@@ -196,7 +204,7 @@ Tests first: `list_after_skips_keys_at_or_before_and_sorts`, `list_dirs_paginate
 Files: `lake/{mod,layout,mem}.rs`, `iceberg_out.rs` visibility.
 Tests first: `parse_partition_spec_variants`, `per_table_setting_overrides_default`,
 `sort_rows_total_order_with_op_tiebreak`, `file_name_is_b_seq_t_i`, `spec_evolution_updates_for_rev5_table`
-(add-spec, set-default-spec, replace-sort-order), `sort_order_declared_on_create`; MemLake:
+(add-spec, set-default-spec, add-sort-order), `sort_order_declared_on_create`; MemLake:
 `commit_all_tables_or_none`, `stale_fence_rejects_whole_transaction`, `take_fence_copies_last_batch`,
 `take_fence_invalidates_older_holder`, `ambiguous_fault_applies_but_errors`,
 `conflict_fault_then_rebuild_succeeds_with_same_files`, `write_files_create_only_same_bytes_ok_different_fails`,

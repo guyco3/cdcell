@@ -152,12 +152,15 @@ How it LISTs. Keys sort by min (B1), so `StartAfter` skips any object that
 starts before it: L1s that straddle the cursor, every L9 (`1-<max>`), every
 object starting at TXID 1. An L0 can straddle too: a drain uploads one
 merged L0 from the replica's last uploaded position (`ltx_repl.rs:4110`,
-`:4150-4160`), and fleet folds do not move that position, so an eviction can
-write L0 `1-600` over L1s `1-256`, `257-512`. So:
+`:4150-4160`), and folds and bundle flushes do not move that position, so a
+drain can write L0 `1-600` over L1s `1-256`, `257-512`. Idle eviction
+normally publishes an L9 instead; a drain L0 comes from a paged cell, a
+snapshot over budget, a failed or invisible L9, cleanup, bucket mode or
+degraded mode (spike `docs/spikes/pr0.md` §1). So:
 
 | Case | LIST |
 |---|---|
-| Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the cell's durable boundary (§2.3). If that does not close the gap, the next LIST lists `e<E>/0000/` in full |
+| Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the highest known **L0** end (or the paged marker) at or below the cursor, from 0 if none is known; never at an L1 or L9 end. If that does not close the gap, the next LIST lists `e<E>/0000/` in full |
 | Epoch change | a delimiter LIST of `cells/<cell>/ltx/` for the epochs (dirs are unpadded decimal, so it returns every epoch, paginated); then each epoch to walk as above, from TXID 0 |
 | Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §10) |
 
@@ -324,7 +327,7 @@ property, last writer wins) would race too.
    committed batch.
 2. **Roll forward** any batch committed after the last checkpoint (§3.3).
 3. **Evolve tables:** partition spec and sort-order changes (including the
-   rev-5 migration: `add-spec`, `set-default-spec`, `replace-sort-order`)
+   rev-5 migration: `add-spec`, `set-default-spec`, `add-sort-order`, `set-default-sort-order`, verified on Lakekeeper 0.15.0; take `source-id`s from the loaded metadata, since Lakekeeper renumbers field ids at create)
    happen only here, before any staging, because Iceberg rejects data files
    whose spec id is not the table's default. The run plan records each
    table's spec id.
@@ -556,8 +559,9 @@ about 42 h in that example. Levers: a lower
   Each stage task writes one file per (table, partition value) unless it is
   larger, named `b<seq>-t<i>-NNNNN.parquet`; in-process `run` is one task,
   so one file per (table, partition value). Format v2, append only.
-  Parquet `created_by` varies by library version; create-only writes
-  (§3.2) make that harmless.
+  cdcell pins Parquet `created_by` (`set_created_by("cdcell")`), so a
+  rerun writes identical bytes even across library upgrades; create-only
+  writes (§3.2) check size and hash.
 
 ### 6.2 Other tables
 
