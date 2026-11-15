@@ -26,7 +26,7 @@ history can be coarser than every capture.
 | Validity | Every emitted version `(epoch, txid)` is a state the cell really had in its restorable history (a prefix of its history). Versions may be skipped. No version is a state that never existed; no phantom (fenced-node) write ever appears. |
 | Order | `(__epoch, __txid)`, compared as a pair, is a total order. Epochs only increase (A6). TXIDs restart only at an epoch boundary: snapshot epochs restart at 1 (D1), paged epochs continue at cut+1 (D2). So `(3, 900) < (4, 1)`. |
 | Consistent views | All tables of one cell at one version come from the same database state (§1.1). |
-| Exactly once | The rows of a committed batch appear once (§3.2). Only the fallback resync may restate rows, as one net change. |
+| Exactly once | The rows of a committed batch appear once (§3.3). Only the fallback resync may restate rows, as one net change. |
 | Grain | Best effort (§4). |
 
 Ordering and consistency are per Durable Object, matching the Durable
@@ -253,28 +253,59 @@ property, last writer wins) would race too.
 ### 3.1 Life of a run
 
 1. **Lease and fence:** take the run lease (`_cdcell/lease.json`). A new
-   holder commits an empty snapshot to the fence branch (§3.3) and
+   holder commits an empty snapshot to the fence branch (§3.4) and
    remembers its id.
-2. **Roll forward** any batch committed after the last checkpoint (§3.2).
+2. **Roll forward** any batch committed after the last checkpoint (§3.3).
 3. **Drain** the queue and split bundles (§2.1). Record `planned_at` and the
    batch seq in `_cdcell/batches/<seq>.json` (create-only).
 4. **Process partitions concurrently:** plan, GET, confirm, apply, decode;
    write journals and snapshots; stage Parquet at deterministic paths
    (`…/data/<partition values>/b<seq>-p<k>-<n>.parquet`), rows sorted by
    the table sort order. Each partition writes its plan
-   `_cdcell/batches/<seq>/p<k>.json` (cells, from, to) create-only and
-   hands its staged files to the committer. `__ingested_at` is
+   `_cdcell/batches/<seq>/p<k>.json` (cells, from, to, staged files)
+   create-only; the committer reads these (works across machines, §3.2). `__ingested_at` is
    `planned_at`, so a rerun writes identical rows.
 5. **Commit** in the committer, in one catalog transaction (Lakekeeper
    `/transactions/commit`): every touched change-log table, the
    `_cdcell_progress` rows (new cursors and `batch`), snapshot summary
-   `cdcell.batch=<seq>`, and the fence (§3.3). Schema evolution and
-   registry updates happen here, serially; a partition that meets a new
-   shape asks the committer for the table schema before staging.
+   `cdcell.batch=<seq>`, and the fence (§3.4). Schema evolution and
+   registry visibility (`cdcell.schemas`) is updated here. A partition that
+   meets a new shape evolves the table itself before staging (§3.2).
 6. **Finish:** checkpoint shards and pending sets; delete the consumed
    dirty lists and superseded journals and snapshots.
 
-### 3.2 Retry rules
+### 3.2 Scaling out: plan, stage, commit
+
+Each Durable Object's work needs only its own objects: a 1:1 map, no joins
+or shuffles. So a run splits into three steps any runner can execute:
+
+```
+cdcell plan                 lease, fence, roll forward, drain the queue, split bundles;
+                            writes the run plan: batch seq, planned_at, partitions → tasks
+cdcell stage --task <i>     N in parallel: decode the task's partitions, write cell state
+                            and Parquet, write p<k>.json per partition (staged files)
+cdcell commit               read every p<k>.json; one atomic commit with the fence
+```
+
+- One machine: `cdcell run` does all three, partitions as threads (default).
+- Several machines: any fan-out runner (a Kubernetes Indexed Job, Cloud Run
+  job tasks, N ECS/Fargate tasks, an Airflow/Argo/Dagster fan-out, or a Spark
+  job that runs `stage` on executors) runs `stage` N times, then `commit`.
+  No cluster framework is required.
+- A failed stage task is rerun: same plan, same cursors, same file names.
+  Nothing is visible until the commit. `commit` waits for every task's
+  files; a missing partition is left for the next run (its cursor does not
+  move).
+- Stage tasks never commit data. Schema is the only shared thing they
+  touch: a task that meets a new shape adds the columns in a schema-only
+  commit with `assert-current-schema-id`, reloading and retrying on 409
+  (adding an existing column is a no-op), then writes files with the new
+  field ids. Schema versions (`fingerprint → __schema_version`) are assigned
+  through a conditional-PUT counter in the state prefix
+  (`_cdcell/schemas/<table>/`), not a last-writer-wins table property; the
+  committer copies the registry into `cdcell.schemas` for readers.
+
+### 3.3 Retry rules
 
 | Failure | What happens |
 |---|---|
@@ -289,7 +320,7 @@ Result: **each batch is committed exactly once**, batches commit in seq
 order, and every cell's rows appear once. Duplicates (rev 5 rule 4) no
 longer arise from crashes.
 
-### 3.3 Fencing inside the commit
+### 3.4 Fencing inside the commit
 
 A lease alone cannot stop a paused old run from committing late. The
 catalog has to reject it. A tiny table `cdcell.<script>._cdcell_fence` has
@@ -390,7 +421,7 @@ fence branch head), remove orphan files of abandoned batches, delete
 metadata after commit. It also bin-packs small files of past days within
 each partition, keeping the sort order. Customers' engines can do the same
 (`OPTIMIZE`, `rewrite_data_files`). These commits can conflict with a run's
-commit; the run retries (§3.2).
+commit; the run retries (§3.3).
 
 ## 6. Cost per run
 
@@ -475,7 +506,7 @@ carries over: tests queue notifications, then call `run_once`.
 4. The `EpochChain` port, property-tested against celld's crate.
 5. The L0 `StartAfter` bound: no L0 straddles a durable boundary
    (§2.1). If one can, list L0 of the epoch in full.
-6. Lakekeeper fencing (§3.3) is verified on 0.15.0; keep it as an e2e
+6. Lakekeeper fencing (§3.4) is verified on 0.15.0; keep it as an e2e
    test.
 
 ## 11. Planned
@@ -485,4 +516,4 @@ carries over: tests queue notifications, then call `run_once`.
   never write again. It is a manual command, not part of runs.
 - Multi-container workers with one committer per partition. Concurrent
   commits to shared tables conflict on sequence numbers (§3), so this needs
-  the rebase-retry of §3.2 on every commit and serialized schema updates.
+  the rebase-retry of §3.3 on every commit and serialized schema updates.
