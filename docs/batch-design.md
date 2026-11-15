@@ -101,9 +101,11 @@ staging data files. Each has:
   they still need).
 
 Partitions do not lease, fence or commit. One committer per run commits all
-partitions' staged work (§3). Doubling P splits every hash range in two;
-`cdcell repartition` (run while no job is running) only moves checkpoint
-shards and pending sets.
+partitions' staged work (§3). P is pinned in `_cdcell/layout.json`
+(written once); every command refuses to run if its P differs. Doubling P
+splits every hash range in two; `cdcell repartition` (offline: no job
+running, lease held) only moves checkpoint shards and pending sets, then
+rewrites `layout.json`.
 
 ### 2.1 Finding the cells to process ("dirty cells")
 
@@ -120,9 +122,9 @@ dropped.
 | **Bundle notifications** (`log/`) | bundle keys with not-yet-folded rows | see §2.4 | only with `CDCELL_TAIL=on` (§2.4) |
 
 - A run drains the broker once, splits the keys by partition, writes them
-  to `_cdcell/p<k>/dirty/<run>.json`, then acknowledges them, so no broker
-  setting has to outlast a run. Each partition's work is its dirty list
-  plus its pending set.
+  to `_cdcell/batches/<seq>/p<k>.keys.json`, then acknowledges them, so no
+  broker setting has to outlast a run (§3.1). Each partition's work is its
+  keys file plus its pending set.
 - Freshness: a cell's changes are found once they are in a per-cell object,
   after a fold or a drain (eviction, handoff, recovery). A quiet cell that
   stays resident keeps fewer than a fold's captures in bundles (C7) and can
@@ -148,13 +150,19 @@ already has (cursor and cell state). This covers:
 
 How it LISTs. Keys sort by min (B1), so `StartAfter` skips any object that
 starts before it: L1s that straddle the cursor, every L9 (`1-<max>`), every
-object starting at TXID 1. So:
+object starting at TXID 1. An L0 can straddle too: a drain uploads one
+merged L0 from the replica's last uploaded position (`ltx_repl.rs:4110`,
+`:4150-4160`), and fleet folds do not move that position, so an eviction can
+write L0 `1-600` over L1s `1-256`, `257-512`. So:
 
 | Case | LIST |
 |---|---|
-| Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the cell's durable boundary (§2.3) |
-| Epoch change | a delimiter LIST of `cells/<cell>/ltx/` for the epochs; then each epoch to walk as above, from TXID 0 |
+| Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the cell's durable boundary (§2.3). If that does not close the gap, the next LIST lists `e<E>/0000/` in full |
+| Epoch change | a delimiter LIST of `cells/<cell>/ltx/` for the epochs (dirs are unpadded decimal, so it returns every epoch, paginated); then each epoch to walk as above, from TXID 0 |
 | Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §10) |
+
+LIST results are sorted by `(epoch, level, min, max)` before planning; no
+ordering is assumed from the store.
 
 There is no other LIST: no sweep, no daily job, no LIST of bundles or live
 sessions, and no guessed-key GETs (an L1's max is not predictable: the fold
@@ -187,13 +195,19 @@ Inputs: cursor `(E, t)`; the cell's objects past it (broker, or a LIST under
    with the tail on, the node leases of bundle rows). That order is the
    confirmation rule (a successor CASes the record before reading data, D5,
    D6):
-   - per-cell object in epoch `E'`: history if `own.epoch == E'`, or if a
-     later paged epoch's marker `(c+1)-(c+1)` proves the cut (D2) and the
-     object ends at or below `c`. Files can land in `E'` after `own.json`
-     moved on (D10): that makes them unproven, not phantom;
+   - per-cell object in epoch `E'`: history if `own.epoch == E'`, or if the
+     next epoch `E'+1` proves a cut `c` (D2) and the object ends at or below
+     `c`. Files can land in `E'` after `own.json` moved on (D10): that makes
+     them unproven, not phantom;
    - bundle row (tail on only): see §2.4.
 
-   A full image proves no cut (D1). A snapshot epoch's TXID-1 image is
+   **A cut is proven by content, never by key.** In bucket mode every L0
+   is `n-n`, so a single-TXID key is not a marker. A cut `c` is proven
+   only by (a) a fetched object of `E'+1` whose LTX header has zero pages
+   and `wal_size == 0` (celld's marker, `ltx/src/db.rs:961-985`), with
+   min `c+1`; or (b) `E'+1`'s lowest TXID from a full listing of `E'+1`
+   from TXID 0 (`EpochChain` semantics). An object of `E'+1` that is not
+   its lowest never sets a cut. A full image proves no cut (D1). A snapshot epoch's TXID-1 image is
    diffed against the state at the last proven point, and the difference is
    emitted as one net change at `(E'', 1)`. Unproven units wait for the
    next run; the cell stops at its last proven point (`parked`).
@@ -213,12 +227,20 @@ always lies on a per-cell object boundary (the **durable boundary**), so the
 state there is a snapshot, or is rebuilt from celld's objects (newest full
 image plus objects), since celld keeps them. cdcell keeps:
 
-- an optional **cell snapshot** (`<state>/<cell>/<epoch>-<txid>.zst`, zstd
+- an optional **cell snapshot**
+  (`<state>/snapshots/<urlenc(cell)>/<epoch:020>-<txid:020>.zst`, zstd
   SQLite pages, immutable): a cache, written only when the replay from the
   newest snapshot or full image would exceed `CDCELL_SNAPSHOT_EVERY`
-  objects (default 8). A PUT costs about 12× a GET.
+  objects (default 8). A PUT costs about 12× a GET. Exception: a paged cell
+  (database at or above `CELLD_LTX_PAGED_MIN_MB`) is snapshotted on first
+  sight and after every run that changes it, ignoring
+  `CDCELL_SNAPSHOT_EVERY`, because rebuilding it means replaying a large
+  full image. Snapshots are written and read streaming, within the memory
+  budget (§3). The root is separate from `cells/`, so cell ids that nest
+  (facets under `cells/`) never collide with a snapshot key.
 
-Snapshots older than the newest one are deleted after the commit. The tail
+After the checkpoint is written, only the previous checkpoint's snapshot
+key for that cell is deleted (never a listing or prefix delete). The tail
 journal exists only with the tail on (§2.4). `--every` mode also keeps
 recently used states in memory (bounded by `CDCELL_STATE_CACHE_MB`).
 
@@ -229,7 +251,10 @@ log never exposes.
 
 Bootstrap (a new cell): the newest full image of the owner's chain is
 emitted as `r` rows. Full-history bootstrap from the oldest epoch is a
-later option.
+later option. Bootstrap and rebuild still run the proof (§2.2): if the
+owner's newest epoch is empty (celld's `EpochChain` skips it,
+`epochs.rs:64`), nothing in older epochs is proven and the cell parks until
+the owner writes.
 
 ### 2.4 Optional live tail (`CDCELL_TAIL=on`)
 
@@ -253,7 +278,7 @@ in bundles give per-capture versions (§4).
   one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s),
   most of them 404 by run time;
 - node lease GETs every run;
-- a **tail journal** per cell (`<state>/<cell>/journal/<epoch>-<from>-<to>.ltx`):
+- a **tail journal** per cell (`<state>/snapshots/<urlenc(cell)>/journal/<epoch>-<from>-<to>.ltx`):
   the raw LTX bytes of confirmed bundle rows applied since the durable
   boundary, required whenever a cursor ends in tail rows (a journal PUT).
   State at the cursor = state at the boundary + journal. Small, because it
@@ -271,8 +296,17 @@ it is not expected in a healthy fleet.
 
 A **batch** is one atomic commit: a set of cells moved from their cursors
 to new proven points. Batch ids (`seq`) increase with every committed
-batch. A run commits one batch, or a few sequential ones if it is very
-large.
+batch (abandoned seqs leave gaps).
+
+**Size.** A batch is capped by cells, bytes and rows (`CDCELL_BATCH_CELLS`,
+`CDCELL_BATCH_BYTES`, `CDCELL_BATCH_ROWS`). `plan` caps cells and notified
+object bytes; a stage task that reaches a cap stops each remaining cell at
+its current proven point and leaves the rest pending. A run then loops:
+several sequential batches, each with its own seq, `commit.json` and fence
+advance, until no work is left (an outage backlog becomes several batches).
+Memory is bounded by one global byte-weighted semaphore over in-flight cells
+(`CDCELL_MEMORY_MB`), not per partition: a cell acquires its object and
+state bytes before it GETs, so one large cell waits rather than overflowing.
 
 Why one committer: concurrent commits to the same Iceberg table conflict,
 because snapshot sequence numbers are per table and shared by all branches
@@ -282,28 +316,48 @@ property, last writer wins) would race too.
 
 ### 3.1 Life of a run
 
-1. **Lease and fence:** take the run lease (`_cdcell/lease.json`). A new
-   holder commits an empty snapshot to the fence branch (§3.4) and
-   remembers its id.
+1. **Lease and fence:** take the run lease (`_cdcell/lease.json`; never
+   while another holder's lease is unexpired). It is renewed during stage
+   and commit. A new holder commits an empty snapshot to the fence branch
+   (§3.4) and remembers its id. That snapshot copies `cdcell.last-batch`
+   from the head it replaces, so taking the fence never hides the last
+   committed batch.
 2. **Roll forward** any batch committed after the last checkpoint (§3.3).
-3. **Drain** the broker (§2.1); with the tail on, split bundles (§2.4).
-   Record `planned_at` and the batch seq in `_cdcell/batches/<seq>.json`
-   (create-only).
-4. **Process partitions concurrently:** plan, GET, confirm, apply, decode;
-   write snapshots (and journals, tail on); stage Parquet at deterministic
-   paths (`…/data/<partition values>/b<seq>-p<k>-<n>.parquet`), rows sorted by
-   the table sort order. Each partition writes its plan
-   `_cdcell/batches/<seq>/p<k>.json` (cells, from, to, staged files)
-   create-only; the committer reads these (works across machines, §3.2). `__ingested_at` is
-   `planned_at`, so a rerun writes identical rows.
-5. **Commit** in the committer, in one catalog transaction (Lakekeeper
-   `/transactions/commit`): every touched change-log table, the
-   `_cdcell_progress` rows (new cursors and `batch`), snapshot summary
-   `cdcell.batch=<seq>`, and the fence (§3.4). Schema evolution and
-   registry visibility (`cdcell.schemas`) is updated here. A partition that
-   meets a new shape evolves the table itself before staging (§3.2).
-6. **Finish:** checkpoint shards and pending sets; delete the consumed
-   dirty lists and superseded snapshots (and journals).
+3. **Evolve tables:** partition spec and sort-order changes (including the
+   rev-5 migration: `add-spec`, `set-default-spec`, `replace-sort-order`)
+   happen only here, before any staging, because Iceberg rejects data files
+   whose spec id is not the table's default. The run plan records each
+   table's spec id.
+4. **Allocate the seq and drain**, in this order: create
+   `_cdcell/batches/<seq>.json` create-only with `seq = max(existing) + 1`
+   (of two concurrent plans, one wins; the loser stops before draining);
+   drain the broker (§2.1; with the tail on, split bundles, §2.4); write
+   each partition's `_cdcell/batches/<seq>/p<k>.keys.json` create-only,
+   merging the keys files of every uncommitted seq above the last committed
+   batch (each merged once, then marked merged), and freezing each named
+   cell's cursor from its checkpoint; then acknowledge the broker. The run
+   plan holds `planned_at`, P, tasks, spec ids and the fence id to assert.
+5. **Stage, partitions concurrently:** plan, GET, confirm, apply, decode;
+   write snapshots (and journals, tail on); write Parquet create-only at
+   deterministic paths (`…/data/<partition values>/b<seq>-t<i>-<n>.parquet`,
+   task `i`), rows sorted by the table sort order. Each partition writes
+   `_cdcell/batches/<seq>/p<k>.json` (cells, from, to, staged files with
+   spec and schema id) create-only; the committer reads these (works across
+   machines, §3.2). `__ingested_at` is `planned_at`, so a rerun writes
+   identical rows. A stage task that meets a new shape adds the columns
+   itself (§3.2).
+6. **Commit** in the committer. First write `_cdcell/batches/<seq>/commit.json`
+   create-only: the included partitions with the content hash of each
+   `p<k>.json`, and the fixed new fence snapshot id for this seq. Then one
+   catalog transaction (Lakekeeper `/transactions/commit`): every touched
+   change-log table, the `_cdcell_progress` rows (new cursors and `batch`),
+   snapshot summary `cdcell.batch=<seq>`, and the fence (§3.4, summary
+   `cdcell.batch` and `cdcell.last-batch`). Registry visibility
+   (`cdcell.schemas`) is updated here. A staged file whose spec id is not
+   the table's current default abandons the batch; the next run restages.
+7. **Finish**, from `commit.json` only: checkpoint shards and pending sets
+   (keys of partitions not in `commit.json` go to their pending sets);
+   delete each cell's previous snapshot key (and journals).
 
 ### 3.2 Scaling out: plan, stage, commit
 
@@ -311,22 +365,22 @@ Each Durable Object's work needs only its own objects: a 1:1 map, no joins
 or shuffles. So a run splits into three steps any runner can execute:
 
 ```
-cdcell plan                 lease, fence, roll forward, drain the broker (tail on: split bundles);
-                            writes the run plan: batch seq, planned_at, partitions → tasks
+cdcell plan                 lease, fence, roll forward, evolve specs, allocate seq, drain the
+                            broker (tail on: split bundles); writes the run plan and keys files
 cdcell stage --task <i>     N in parallel: decode the task's partitions, write cell state
                             and Parquet, write p<k>.json per partition (staged files)
 cdcell commit               read every p<k>.json; one atomic commit with the fence
 ```
 
 - **Only `plan` reads the broker.** It drains it with concurrent pollers,
-  writes the keys per partition (`_cdcell/runs/<seq>/p<k>/keys.json`), and
+  writes the keys per partition (`_cdcell/batches/<seq>/p<k>.keys.json`), and
   acknowledges the messages only after those files are written. With the
   tail on, it also GETs and splits bundles into per-partition row files
   (§2.4). Stage tasks read their
   partitions' files from the state prefix: no competing consumers, no
   visibility timeout or ack deadline spanning a run, no ordering needed.
-  Files of a failed run stay as the pending set; the next `plan` merges
-  them with new messages.
+  Keys files of a failed run stay; the next `plan` merges them with new
+  messages (§3.1 step 4).
 - **Customers do not partition their broker.** S3 notifications filter only
   by prefix/suffix (no hashing), so one ordinary broker receives everything
   and `plan` does the partitioning. The broker carries per-cell objects (and
@@ -340,15 +394,22 @@ cdcell commit               read every p<k>.json; one atomic commit with the fen
   job tasks, N ECS/Fargate tasks, an Airflow/Argo/Dagster fan-out, or a Spark
   job that runs `stage` on executors) runs `stage` N times, then `commit`.
   No cluster framework is required.
-- A failed stage task is rerun: same plan, same cursors, same file names.
-  Nothing is visible until the commit. `commit` waits for every task's
-  files; a missing partition is left for the next run (its cursor does not
-  move).
+- A failed stage task is rerun: same plan, same cursors (frozen in the keys
+  files, never read from live checkpoints), same file names. Data files are
+  create-only: if a file exists, its size and hash must match, else the task
+  fails. A task exits as a no-op if its `p<k>.json` already exists or its
+  seq is at or below the fence head's last committed batch, so a task
+  retried after the commit writes nothing. Nothing is visible until the
+  commit. `commit` waits for every task's files up to
+  `CDCELL_COMMIT_WAIT`; a missing partition is left for the next run (its
+  cursor does not move).
 - Stage tasks never commit data. Schema is the only shared thing they
   touch: a task that meets a new shape adds the columns in a schema-only
-  commit with `assert-current-schema-id`, reloading and retrying on 409
-  (adding an existing column is a no-op), then writes files with the new
-  field ids. Schema versions (`fingerprint → __schema_version`) are assigned
+  commit with `assert-current-schema-id`. On 409 it reloads, recomputes
+  `plan_columns` against the fresh schema (a name taken with another type
+  becomes `<col>__<type>`) and retries with only the still-missing columns;
+  adding an existing name is an error in Iceberg, never a no-op. It then
+  writes files with the new field ids. Schema versions (`fingerprint → __schema_version`) are assigned
   through a conditional-PUT counter in the state prefix
   (`_cdcell/schemas/<table>/`), not a last-writer-wins table property; the
   committer copies the registry into `cdcell.schemas` for readers.
@@ -357,12 +418,11 @@ cdcell commit               read every p<k>.json; one atomic commit with the fen
 
 | Failure | What happens |
 |---|---|
-| Before the commit (any error, crash) | The batch did not happen. The next attempt plans again from the checkpoint cursors with a new seq. Staged files of the abandoned batch are orphans (`cdcell maintain` removes them). |
-| Commit ambiguous (timeout, 5xx) | Load the fence branch head: our new snapshot id → committed, go to step 6; the previous id → resend the same commit; anything else → fenced out, stop. |
-| 409 on the fence (`CatalogCommitConflicts`, "Branch or tag … snapshot has changed" or "already exists") | Another run took over: stop. |
-| Any other 409 (e.g. sequence number, from `maintain` or a customer's compaction) | Reload the tables, rebuild only the snapshot and manifest list over the new parent, reusing the staged data files and manifests; retry with jitter. |
-| After the commit, before the checkpoint | On start, roll forward from the fence branch head (its summary carries `cdcell.batch`) and the `_cdcell_progress` rows, not from table snapshot summaries, which `maintain` expires. |
-| One cell fails (unreadable object, transient error) | The cell is left out with its cursor unchanged, logged and counted, and its keys go to the pending set for the next run. Other cells continue. |
+| Before the commit (any error, crash) | The batch did not happen. The next plan merges its keys files and plans again from the checkpoint cursors with a new seq. Its staged files are orphans (`cdcell maintain` removes them, §6.3). |
+| Commit ambiguous (timeout, 5xx), or any 409 | Reload the fence head. Equal to our fixed new id (from `commit.json`) → committed, finish. Still our expected id → the 409 was another table (sequence number, from `maintain` or a customer's compaction): reload the tables, rebuild only the snapshot and manifest list over the new parent, reusing the staged files and manifests; retry with jitter (after an ambiguous outcome, resend). Anything else → another run took the fence: stop. So an ambiguous commit that lands late, followed by a resend that gets 409, is still committed. |
+| After the commit, before the checkpoint | On start, roll forward: the fence head summary (`cdcell.batch`, or `cdcell.last-batch` after a take) names the last committed seq; finish it from its `commit.json` only, never from table snapshot summaries (which `maintain` expires) or from `p<k>.json` files not listed there. |
+| Stale finisher | Checkpoint shards are written with ETag CAS and carry the last seq; a shard is never overwritten with a lower seq. Pending sets are CAS too. |
+| One cell fails (unreadable object, transient error) | The cell is left out with its cursor unchanged and none of its rows staged, logged and counted, and its keys go to the pending set for the next run. Other cells continue. |
 
 Result: **each batch is committed exactly once**, batches commit in seq
 order, and every cell's rows appear once. Duplicates (rev 5 rule 4) no
@@ -374,14 +434,22 @@ A lease alone cannot stop a paused old run from committing late. The
 catalog has to reject it. A tiny table `cdcell.<script>._cdcell_fence` has
 one branch, `run`. Every batch commit includes
 `assert-ref-snapshot-id(run, <id this committer last wrote>)` and advances
-the branch with a new snapshot whose id the committer picks, so it knows
-the new head without a reload. A new run holder first commits an empty
-snapshot to `run`, which makes every older holder's pending commit fail as
-a whole.
+the branch with a new snapshot whose id the committer picks and records in
+`commit.json` first, so it knows the new head without a reload. A new run
+holder first commits an empty snapshot to `run` (copying
+`cdcell.last-batch`, §3.1), which makes every older holder's pending commit
+fail as a whole.
 
-Verified on Lakekeeper 0.15.0: a stale `assert-ref-snapshot-id` rejects the
-whole multi-table request with 409 and no table changes; fence snapshots
-need no data files; success is 200 with an empty body.
+Verified on Lakekeeper 0.15.0:
+- first take: `assert-ref-snapshot-id` with `snapshot-id: null` (branch
+  absent);
+- `add-snapshot` whose manifest list need not exist (no data files);
+- `set-snapshot-ref` with `type: branch`;
+- success is 200 with an empty body;
+- a stale assert rejects the whole multi-table request with 409
+  `CatalogCommitConflicts` and no table changes;
+- a sequence-number conflict on a data table is 409
+  `CommitFailedException`.
 
 ## 4. History detail (customer choice)
 
@@ -467,7 +535,8 @@ about 42 h in that example. Levers: a lower
   create stray partitions, and correctness never depends on `__ts`; order
   and as-of logic use `(__epoch, __txid)`.
 - **Sort order: `__cell_id, __key, __epoch, __txid`** (declared as the
-  table's sort order, applied when writing each file). Per-object queries
+  table's sort order, applied when writing each file; `__op` breaks ties so
+  the order is total and reruns write identical rows). Per-object queries
   (`__cell_id = …`) and type-1 MERGEs prune by column statistics without
   extra partitions. Engines that compact keep the order. The order within a
   file is for pruning; consumers still order by `(__epoch, __txid)`.
@@ -483,9 +552,12 @@ about 42 h in that example. Levers: a lower
   reruns are identical) and can be older than rows already visible. A
   consumer that must use it reads `__ingested_at > <last> - <max batch
   latency>` and dedups.
-- Files: zstd Parquet, target 256 MiB (`write.target-file-size-bytes`). A
-  batch writes one file per (table, day) unless it is larger. Format v2,
-  append only.
+- Files: zstd Parquet, target 256 MiB (`write.target-file-size-bytes`).
+  Each stage task writes one file per (table, partition value) unless it is
+  larger, named `b<seq>-t<i>-NNNNN.parquet`; in-process `run` is one task,
+  so one file per (table, partition value). Format v2, append only.
+  Parquet `created_by` varies by library version; create-only writes
+  (§3.2) make that harmless.
 
 ### 6.2 Other tables
 
@@ -499,7 +571,11 @@ about 42 h in that example. Levers: a lower
 
 `cdcell maintain` (scheduled, e.g. daily): expire snapshots (never the
 fence branch head), remove orphan files of abandoned batches, delete
-metadata after commit. It also bin-packs small files of past days within
+metadata after commit. An orphan is deleted only if its seq is below the
+fence head's last batch, it is listed in no `commit.json`, and it is older
+than an age floor (`CDCELL_ORPHAN_MIN_AGE`, default 24h); never a file whose
+seq is at or above the newest `batches/<seq>.json`, so files of a run in
+flight survive. It also bin-packs small files of past days within
 each partition, keeping the sort order. Customers' engines can do the same
 (`OPTIMIZE`, `rewrite_data_files`). These commits can conflict with a run's
 commit; the run retries (§3.3).
@@ -508,10 +584,10 @@ commit; the run retries (§3.3).
 
 | Item | Requests |
 |---|---|
-| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a snapshot PUT only per `CDCELL_SNAPSHOT_EVERY` |
-| Per LISTing cell | gap: 3 LISTs (L0, L1, L9); epoch change: 1 delimiter LIST plus 3 per walked epoch. Epoch changes are routine (A6), so expect this for cells restarted since the last run |
-| Per run | the broker drain; one lease write; one catalog transaction (or a few for a huge run) |
-| Per batch | one Parquet file per (table, day) |
+| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a snapshot PUT only per `CDCELL_SNAPSHOT_EVERY` (every changed run for paged cells, §2.3) |
+| Per LISTing cell | gap: 3 LISTs (L0, L1, L9), plus a full L0 LIST if a straddling L0 kept the gap open; epoch change: 1 delimiter LIST (every epoch dir, paginated, since dirs are unpadded decimal) plus 3 per walked epoch. Epoch changes are routine (A6), so expect this for cells restarted since the last run |
+| Per run | the broker drain; one lease write plus renewals; one catalog transaction per batch (several for a backlog, §3) |
+| Per batch | one Parquet file per (table, partition value, task); `commit.json` and keys files; the commit reads manifests (`check_duplicate`, kept and measured) |
 | Tail on only (§2.4) | per run: one GET per notified bundle key (most 404), node lease GETs; per cell: a journal PUT when the cursor ends in tail rows |
 
 Compared with revision 5:
@@ -522,7 +598,8 @@ Compared with revision 5:
 - no always-on worker.
 
 `docs/cost.md` will measure this on the e2e stack (MinIO request metrics),
-as a function of cells, write rate, restart rate and run interval.
+as a function of cells, write rate, restart rate and run interval, and with
+celld `CELLD_LTX_COMPACTION_MIN_TXIDS=16`.
 
 ## 8. Deployment
 
@@ -573,7 +650,8 @@ Engines such as Spark belong on the consumer side, if the customer has one
    between successful runs (§5). Otherwise the fallback resync applies:
    current state exact, history in the gap lost.
 2. Read access to the celld bucket; read/write to the lake bucket, the
-   catalog and `CDCELL_STATE_URL` (its own IAM and KMS, §2.3).
+   catalog and `CDCELL_STATE_URL` (its own IAM and KMS, §2.3; the policy
+   ships in `docs/deploy.md`).
 3. A scheduler: cron, Kubernetes CronJob, ECS scheduled task (`cdcell run
    --once`); or one long-running `cdcell run` that repeats every
    `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
@@ -590,9 +668,9 @@ Engines such as Spark belong on the consumer side, if the customer has one
 | Kept | Changed or replaced |
 |---|---|
 | decoder (`cdcell-core`), emit, schema registry and evolution (now committer-only), `iceberg_out` staging and atomic commit, resync fallback, keys, metrics, IAM policy, maintain | `pipeline.rs` streaming state machine, `run.rs` intake loop, gap timers, in-memory parking, JetStream ack handling |
-| | `resync::plan_chain`: not celld's `EpochChain`. celld skips an intermediate epoch whose clipped objects do not end at the cut and keeps walking down (`crates/ltx/src/client/epochs.rs:50-75`); `plan_chain` returns None. Port `EpochChain` exactly. |
-| | Rev-5 tables use `bucket(16, __cell_id)`: adopting `day(__ts)` needs partition evolution (no rewrite). |
-| | Rev-5 file names are random and rows unsorted: now deterministic names and sorted rows (§3.1). |
+| | `resync::plan_chain`: not celld's `EpochChain`. celld skips an intermediate epoch whose clipped objects do not end at the cut and keeps walking down, and skips an empty newest epoch (`crates/ltx/src/client/epochs.rs:50-75`); `plan_chain` returns None. Port `EpochChain` exactly. |
+| | Rev-5 tables use `bucket(16, __cell_id)`: adopting `day(__ts)` needs partition evolution in `plan` (no rewrite, §3.1). |
+| | Rev-5 file names are random and rows unsorted: now deterministic names, create-only writes and sorted rows (§3.1). |
 
 The test kit (fake celld with real SQLite and LTX, `MemSink`, paused time)
 carries over: tests enqueue notifications, then call `run_once`.
@@ -602,14 +680,18 @@ carries over: tests enqueue notifications, then call `run_once`.
 1. Freshness of quiet resident cells with `CELLD_IDLE_EVICT_S` and without;
    tail on vs off (e2e).
 2. celld with `CELLD_LTX_COMPACTION_MIN_TXIDS=16`: write-path and takeover
-   cost.
+   cost (`docs/cost.md`).
 3. The finest-chain planner against every overlap celld produces (merged
-   drain L0s, L1s from the bundle overlay, recovery windows): property test
-   in the test kit.
+   drain L0s, L1s from the bundle overlay, recovery windows, straddles):
+   property test in the test kit.
 4. The `EpochChain` port, property-tested against celld's crate.
-5. The L0 `StartAfter` bound: no L0 straddles a durable boundary
-   (§2.1). If one can, list L0 of the epoch in full.
-6. Lakekeeper fencing (§3.4) is verified on 0.15.0; keep it as an e2e
+5. L0 straddles (§2.1): reproduce a drain L0 over earlier L1s in the test
+   kit; the full-L0 fallback must close every such gap.
+6. Marker identification by content (§2.2): zero pages and `wal_size == 0`
+   on real celld markers; no bucket-mode `n-n` L0 matches.
+7. `add-spec` / `set-default-spec` on a rev-5 table, and `DataFile` JSON
+   across processes with an evolved schema.
+8. Lakekeeper fencing (§3.4) is verified on 0.15.0; keep it as an e2e
    test.
 
 ## 12. Planned
