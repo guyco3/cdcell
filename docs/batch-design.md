@@ -296,6 +296,13 @@ cdcell commit               read every p<k>.json; one atomic commit with the fen
   visibility timeout or ack deadline spanning a run, no ordering needed.
   Files of a failed run stay as the pending set; the next `plan` merges
   them with new messages.
+- **Customers do not partition their queue.** S3 notifications filter only
+  by prefix/suffix (no hashing), so one ordinary queue receives everything
+  and `plan` does the partitioning. The queue carries folds and bundles,
+  not captures, so one drainer keeps up; if it ever does not, `plan` runs
+  several pollers on the same queue (SQS and JetStream allow concurrent
+  consumers). A Kafka/Kinesis adapter whose topic is keyed by cell id
+  (customer-routed) could let stage tasks read their own partitions; later.
 - One machine: `cdcell run` does all three, partitions as threads (default).
 - Several machines: any fan-out runner (a Kubernetes Indexed Job, Cloud Run
   job tasks, N ECS/Fargate tasks, an Airflow/Argo/Dagster fan-out, or a Spark
