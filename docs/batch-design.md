@@ -30,6 +30,9 @@ history can be coarser than every capture.
 | Grain | Best effort (§4). |
 | Freshness | A change reaches the lake once it is in a per-cell object: after a fold (`CELLD_LTX_COMPACTION_MIN_TXIDS` captures or 32 MiB) or a drain (eviction, handoff, recovery), then the next run. A quiet cell that stays resident can wait until its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds this (idle eviction writes the cell's changes to a per-cell object); the next activation starts a new epoch, so history across that restart is coarser (§4). |
 
+These guarantees hold by default. Freshness and history detail depend on
+the customer's celld settings (§5).
+
 Ordering and consistency are per Durable Object, matching the Durable
 Object model (objects are independent; there are no cross-object
 transactions).
@@ -106,7 +109,7 @@ shards and pending sets.
 
 A **message broker** is the only discovery mechanism. celld's bucket sends a
 notification for every object created under `cells/` to the broker (SQS,
-Kafka, JetStream, …; any works, §7), at least once (§8). Ordering is not
+Kafka, JetStream, …; any works, §8), at least once (§9). Ordering is not
 required: keys are sorted per cell before planning. Rules filter to `.ltx`
 keys (G5); anything else that slips through (`own.json`, `retired.json`) is
 dropped.
@@ -126,10 +129,10 @@ dropped.
   wait until its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds the
   wait: idle eviction writes the cell's changes to a per-cell object. The
   next activation starts a new epoch, so history across that restart is
-  coarser (§4). The opt-in live tail (§2.4) is the other way.
+  coarser (§4, §5). The opt-in live tail (§2.4) is the other way.
 - Cells that existed before cdcell was deployed and never write again are
   not exported: no notification ever names them. A one-time, operator-run
-  `cdcell backfill` is planned (§11).
+  `cdcell backfill` is planned (§12).
 
 **When cdcell LISTs.** Only for one cell, and only when **its notified keys
 do not by themselves give an unbroken, provable chain** from what cdcell
@@ -151,7 +154,7 @@ object starting at TXID 1. So:
 |---|---|
 | Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the cell's durable boundary (§2.3) |
 | Epoch change | a delimiter LIST of `cells/<cell>/ltx/` for the epochs; then each epoch to walk as above, from TXID 0 |
-| Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §9) |
+| Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §10) |
 
 There is no other LIST: no sweep, no daily job, no LIST of bundles or live
 sessions, and no guessed-key GETs (an L1's max is not predictable: the fold
@@ -172,7 +175,7 @@ own once folded.
 | Missing in the middle (cursor 299; broker has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. The LIST rule applies and the run continues with what it finds. |
 | Missing at the end (broker has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
-| Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§8). |
+| Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§9). |
 | Owner restarted into a snapshot epoch before the run read the old epoch's last objects | Those unproven objects and the new epoch's first writes become one net change at the opener (§4). |
 
 ### 2.2 Planning one cell
@@ -246,7 +249,7 @@ a guarantee (C12).
 in bundles give per-capture versions (§4).
 
 **What it costs.**
-- bundle notifications under `log/` (suffix `.ltxb`, §8), one message and
+- bundle notifications under `log/` (suffix `.ltxb`, §9), one message and
   one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s),
   most of them 404 by run time;
 - node lease GETs every run;
@@ -382,12 +385,12 @@ need no data files; success is 200 with an empty body.
 
 ## 4. History detail (customer choice)
 
-| Goal | celld setting | Grain |
-|---|---|---|
-| Current state, coarse history | defaults | one version per fold (≥ 256 captures or 32 MiB) while a cell stays active between runs; with `CDCELL_TAIL=on`, per capture for rows still in bundles (§2.4) |
-| Finer history | lower `CELLD_LTX_COMPACTION_MIN_TXIDS` (16-64) | per that many captures; more celld PUTs, slower takeovers |
-| Finer history, bucket mode | `CELLD_DURABILITY=bucket` | per upload pass, usually per capture (under backlog `sync_cell` merges the TXIDs since the last upload into one L0); write acks wait for S3 |
-| Every event | insert-only events table in the app | exact |
+By default a cell gets one version per fold (≥ 256 captures or 32 MiB)
+while it stays active between runs, and one per drain (eviction, handoff,
+recovery). Finer history comes from celld settings (§5); exact events need
+an insert-only events table in the app. With `CDCELL_TAIL=on`, rows still
+in bundles give per-capture versions (§2.4). Within a capture, SQLite
+commits are already merged (§1.2).
 
 **Restarts between runs.** Every activation advances the epoch (A6). A
 database under `CELLD_LTX_PAGED_MIN_MB` (default 256 MiB) gets a snapshot
@@ -397,23 +400,51 @@ Read hours later, after `own.json` moved on, the old epoch's last objects
 cannot be proven. So those unproven objects and the new epoch's first
 writes collapse into one net change at the new opener: across a restart
 between runs, one version per activation for the unproven part. With
-`CELLD_IDLE_EVICT_S` or frequent deploys this is common. Paged epochs
-(≥ 256 MiB) carry the cut (D2) and keep their grain. Shorter run intervals
-and the opt-in live tail reduce the unproven part.
-
-**Freshness vs grain.** Without the tail, a quiet resident cell's changes
-reach the lake at its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds
-that wait, at the cost above: each idle eviction is a restart, so history
-across it is coarser.
+`CELLD_IDLE_EVICT_S` or frequent deploys this is common. Paged epochs carry
+the cut (D2) and keep their grain. Shorter run intervals and the opt-in
+live tail reduce the unproven part.
 
 Later: on a versioned bucket, GC'd bundles stay readable as noncurrent
 versions, which gives per-capture history without bucket mode. That needs
 a fold check (not built): bundle rows must replay to the L1 that covers
 them.
 
-## 5. Iceberg layout
+## 5. celld settings and what they mean for cdcell
 
-### 5.1 Partitioning and sort order (change-log tables)
+These settings belong to the customer's celld deployment, not to cdcell.
+cdcell's freshness, history detail and some guarantees depend on them.
+
+**Recommended:** cdcell `CDCELL_TAIL=off` (the default); celld
+`CELLD_IDLE_EVICT_S` set (e.g. `300`); celld's epoch GC off (its default) or
+with a grace longer than cdcell's longest outage.
+
+| Setting | celld default | Freshness | History detail | Guarantees | Cost / trade-off |
+|---|---|---|---|---|---|
+| `CELLD_IDLE_EVICT_S` | unset | an idle cell is evicted after N s; eviction writes its changes to a per-cell object, so the next run sees them. Bounds freshness for cells that go idle | each later activation starts a new epoch (A6); across a restart between runs, a snapshot epoch collapses the unproven part (D1, §4) | none on validity | more activations and epochs |
+| `CELLD_LTX_COMPACTION_MIN_TXIDS`, `CELLD_LTX_COMPACTION_MIN_MB` | 256 captures, 32 MiB | lower values fold more often: fresher for busy cells and for slow cells that are never idle | finer: one version per that many captures | none on validity | more celld PUTs; more objects to read on takeover and restore |
+| `CELLD_LTX_RETENTION_SECS` (epoch GC) | off | none | off: nothing cdcell needs is deleted. On, with a grace shorter than cdcell's longest outage: history in the gap is lost | fallback resync: current state stays exact, rows are restated as one net change (the only exactly-once exception) | storage, if left off |
+| `CELLD_DURABILITY` | `fleet` | `bucket`: per-cell objects are written at once, so fresh every run | `bucket`: one L0 per upload pass, usually per capture (finest) | none on validity | `bucket`: write acks wait for S3 |
+| `CELLD_LTX_PAGED_MIN_MB` | 256 | none | databases at or above it use paged epochs, which carry the cut (D2), so history is kept across restarts; below it, snapshot epochs collapse the unproven part | none on validity | a celld restore-path choice; nothing for cdcell |
+| cdcell `CDCELL_TAIL=on` (for contrast, §2.4) | off | fresh every run for every cell | per capture for unfolded changes | validity has a rare, detected, self-correcting exception (C12) | bundle notifications and GETs, node lease reads, tail journals |
+
+**Guaranteed regardless of settings:**
+- validity (with the tail off);
+- order by `(__epoch, __txid)`;
+- consistent views per object;
+- exactly once per batch (except the fallback resync);
+- current state exact.
+
+**Depends on settings:** freshness and history detail (table above).
+
+**Known gap.** With the recommended defaults, a slow cell that is never idle
+long enough to be evicted (e.g. one write every 10 min with
+`CELLD_IDLE_EVICT_S=900`) appears only after its next fold: 256 captures,
+about 42 h in that example. Levers: a lower
+`CELLD_LTX_COMPACTION_MIN_TXIDS`, or the opt-in tail.
+
+## 6. Iceberg layout
+
+### 6.1 Partitioning and sort order (change-log tables)
 
 - **Partition spec: configurable, default `day(__ts)`.** Iceberg hidden
   partitioning with a transform, the standard for Iceberg (not Hive-style
@@ -456,7 +487,7 @@ them.
   batch writes one file per (table, day) unless it is larger. Format v2,
   append only.
 
-### 5.2 Other tables
+### 6.2 Other tables
 
 - `_cdcell_progress`: `day(committed_at)`, sorted by `_cell_id`; one row per
   cell per batch. The newest row per cell is its cursor, and the checkpoint
@@ -464,7 +495,7 @@ them.
 - `_cdcell_kv`: like change-log tables.
 - `_cdcell_fence`: no data, one branch.
 
-### 5.3 Maintenance
+### 6.3 Maintenance
 
 `cdcell maintain` (scheduled, e.g. daily): expire snapshots (never the
 fence branch head), remove orphan files of abandoned batches, delete
@@ -473,7 +504,7 @@ each partition, keeping the sort order. Customers' engines can do the same
 (`OPTIMIZE`, `rewrite_data_files`). These commits can conflict with a run's
 commit; the run retries (§3.3).
 
-## 6. Cost per run
+## 7. Cost per run
 
 | Item | Requests |
 |---|---|
@@ -493,7 +524,7 @@ Compared with revision 5:
 `docs/cost.md` will measure this on the e2e stack (MinIO request metrics),
 as a function of cells, write rate, restart rate and run interval.
 
-## 7. Deployment
+## 8. Deployment
 
 cdcell is one container image (a static binary inside) that runs a batch and
 exits (`cdcell run --once`), or repeats every `CDCELL_RUN_INTERVAL`. It needs
@@ -536,10 +567,10 @@ Kafka `retention.ms`, JetStream `max_age`) must exceed the longest outage.
 Engines such as Spark belong on the consumer side, if the customer has one
 (type-1/type-2 MERGEs; consumer guide). None is required.
 
-## 8. Operating requirements
+## 9. Operating requirements
 
 1. celld's epoch GC off (default), or its grace above the longest gap
-   between successful runs. Otherwise the fallback resync applies:
+   between successful runs (§5). Otherwise the fallback resync applies:
    current state exact, history in the gap lost.
 2. Read access to the celld bucket; read/write to the lake bucket, the
    catalog and `CDCELL_STATE_URL` (its own IAM and KMS, §2.3).
@@ -554,7 +585,7 @@ Engines such as Spark belong on the consumer side, if the customer has one
    JetStream `max_age`). Without it, a quiet cell's final objects may never
    be exported: no later write reveals the gap.
 
-## 9. What carries over from the streaming code
+## 10. What carries over from the streaming code
 
 | Kept | Changed or replaced |
 |---|---|
@@ -566,7 +597,7 @@ Engines such as Spark belong on the consumer side, if the customer has one
 The test kit (fake celld with real SQLite and LTX, `MemSink`, paused time)
 carries over: tests enqueue notifications, then call `run_once`.
 
-## 10. To verify or build before shipping
+## 11. To verify or build before shipping
 
 1. Freshness of quiet resident cells with `CELLD_IDLE_EVICT_S` and without;
    tail on vs off (e2e).
@@ -581,7 +612,7 @@ carries over: tests enqueue notifications, then call `run_once`.
 6. Lakekeeper fencing (§3.4) is verified on 0.15.0; keep it as an e2e
    test.
 
-## 11. Planned
+## 12. Planned
 
 - `cdcell backfill`: a one-time command the operator runs at install. It
   LISTs `cells/` once and exports cells that existed before cdcell and
