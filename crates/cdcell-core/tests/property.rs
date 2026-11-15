@@ -350,19 +350,17 @@ fn run(
             .apply(changed, commit)
             .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
         for s in &changes.schema {
-            match s {
-                SchemaChange::AlterTable {
-                    table,
-                    renamed: Some((old, new)),
-                    ..
-                } => {
-                    for row in model.entry(table.clone()).or_default().values_mut() {
-                        if let Some(v) = row.remove(old) {
-                            row.insert(new.clone(), v);
-                        }
+            if let SchemaChange::AlterTable {
+                table,
+                renamed: Some((old, new)),
+                ..
+            } = s
+            {
+                for row in model.entry(table.clone()).or_default().values_mut() {
+                    if let Some(v) = row.remove(old) {
+                        row.insert(new.clone(), v);
                     }
                 }
-                _ => {}
             }
         }
         let dropped: Vec<String> = changes
@@ -418,7 +416,10 @@ fn run(
         // A dropped table's rows are all deleted (the delete events above).
         for table in dropped {
             let left = model.remove(&table).map(|t| t.len()).unwrap_or(0);
-            assert_eq!(left, 0, "seed {seed} step {step}: rows of dropped {table} not deleted");
+            assert_eq!(
+                left, 0,
+                "seed {seed} step {step}: rows of dropped {table} not deleted"
+            );
         }
         check(&model, &conn, &dec, step);
         prev = cur;

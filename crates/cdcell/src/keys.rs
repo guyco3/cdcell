@@ -38,6 +38,13 @@ pub fn url_decode(key: &str) -> String {
         .into_owned()
 }
 
+/// The key celld writes for a per-cell LTX object (celld
+/// `client/object_store.rs`: level `{:04x}`, TXIDs `{:016x}`), without the
+/// fleet prefix. [`parse`] inverts it.
+pub fn ltx_key(cell: &str, epoch: u64, level: u32, min: u64, max: u64) -> String {
+    format!("cells/{cell}/ltx/e{epoch}/{level:04x}/{min:016x}-{max:016x}.ltx")
+}
+
 /// Parses a decoded key with the fleet prefix already stripped.
 pub fn parse(key: &str) -> ObjKey {
     if let Some(rest) = key.strip_prefix("cells/") {
@@ -143,8 +150,34 @@ mod tests {
         );
         assert_eq!(parse("nodes/celld-a.json"), ObjKey::Other);
         assert_eq!(
+            ltx_key("Shop:ab", 12, 0, 10, 12),
+            "cells/Shop:ab/ltx/e12/0000/000000000000000a-000000000000000c.ltx"
+        );
+        assert_eq!(
             parse("cells/R:1/facets/ab/ltx/e1/0000/0000000000000001-0000000000000001.ltx"),
             ObjKey::Other
+        );
+    }
+
+    #[test]
+    fn ltx_key_round_trips_through_obj_from_key() {
+        use crate::batch::obj::Obj;
+        let o = Obj {
+            epoch: 3,
+            level: 9,
+            min: 1,
+            max: 0x1_0000_0001,
+        };
+        let key = o.key("Shop:ab");
+        assert_eq!(
+            key,
+            "cells/Shop:ab/ltx/e3/0009/0000000000000001-0000000100000001.ltx"
+        );
+        assert_eq!(Obj::from_key(&key), Some(("Shop:ab".to_string(), o)));
+        assert_eq!(Obj::from_key("cells/Shop:ab/own.json"), None);
+        assert_eq!(
+            Obj::from_key("cells/a/ltx/e1/0000/0000000000000005-0000000000000004.ltx"),
+            None
         );
     }
 }

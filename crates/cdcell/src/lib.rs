@@ -7,6 +7,7 @@
 //! through [`intake`], with [`source::Store::memory`] buckets and an
 //! [`out::MemSink`].
 
+pub mod batch;
 pub mod capture;
 pub mod emit;
 pub mod iceberg_out;

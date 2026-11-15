@@ -32,4 +32,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 [dev-dependencies]
 celld-ltx.workspace = true
 rusqlite.workspace = true
+proptest = "1"
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
