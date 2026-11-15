@@ -8,7 +8,7 @@ body=$(curl -sf http://127.0.0.1:9464/metrics) || fail "no metrics endpoint on :
 for m in cdcell_events_total cdcell_commits_total cdcell_commit_seconds_sum cdcell_units_total \
          cdcell_watermark_age_seconds_max cdcell_watermark_age_seconds_p99 cdcell_open_gaps cdcell_parked_cells cdcell_parked_age_seconds_max \
          cdcell_phantoms_dropped_total cdcell_duplicates_dropped_total cdcell_not_found_total \
-         cdcell_decode_errors_total cdcell_resyncs_total cdcell_shadow_restores_total cdcell_reconciled_bundles_total \
+         cdcell_decode_errors_total cdcell_resyncs_total cdcell_rebuilds_total cdcell_reconciled_bundles_total \
          'cdcell_s3_requests_total{op="get"}' 'cdcell_s3_requests_total{op="list"}' 'cdcell_s3_requests_total{op="put"}'; do
   grep -q "^$m " <<<"$body" || fail "missing metric $m"
 done

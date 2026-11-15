@@ -25,7 +25,7 @@ impl Pages {
             return Err(Error::Malformed("image shorter than the header"));
         }
         let page_size = page_size_from_header(image);
-        if image.len() % page_size != 0 {
+        if !image.len().is_multiple_of(page_size) {
             return Err(Error::Malformed("image not a whole number of pages"));
         }
         let commit = (image.len() / page_size) as u32;
@@ -34,7 +34,12 @@ impl Pages {
             .enumerate()
             .map(|(i, p)| (i as u32 + 1, p.to_vec()))
             .collect();
-        Ok(Pages { page_size, usable: page_size - usize::from(image[20]), commit, pages })
+        Ok(Pages {
+            page_size,
+            usable: page_size - usize::from(image[20]),
+            commit,
+            pages,
+        })
     }
 
     /// The full database image (missing pages zero-filled, e.g. the lock page).
@@ -50,7 +55,9 @@ impl Pages {
     }
 
     pub fn encoding(&self) -> TextEncoding {
-        self.pages.get(&1).map_or(TextEncoding::Utf8, |p| TextEncoding::from_header(p))
+        self.pages
+            .get(&1)
+            .map_or(TextEncoding::Utf8, |p| TextEncoding::from_header(p))
     }
 }
 
@@ -70,10 +77,18 @@ pub struct View<'a> {
 
 impl<'a> View<'a> {
     pub fn before(base: &'a Pages) -> View<'a> {
-        View { base, overlay: None, commit: base.commit }
+        View {
+            base,
+            overlay: None,
+            commit: base.commit,
+        }
     }
     pub fn after(base: &'a Pages, overlay: &'a HashMap<u32, Vec<u8>>, commit: u32) -> View<'a> {
-        View { base, overlay: Some(overlay), commit }
+        View {
+            base,
+            overlay: Some(overlay),
+            commit,
+        }
     }
 
     pub fn page(&self, pgno: u32) -> Result<&'a [u8]> {
@@ -83,7 +98,11 @@ impl<'a> View<'a> {
         if let Some(p) = self.overlay.and_then(|o| o.get(&pgno)) {
             return Ok(p);
         }
-        self.base.pages.get(&pgno).map(Vec::as_slice).ok_or(Error::MissingPage(pgno))
+        self.base
+            .pages
+            .get(&pgno)
+            .map(Vec::as_slice)
+            .ok_or(Error::MissingPage(pgno))
     }
 
     pub fn usable(&self) -> usize {
@@ -129,7 +148,10 @@ pub fn walk(view: &View<'_>, root: u32) -> Result<Structure> {
         if h.is_interior() {
             s.interior.insert(pgno);
             for &c in &h.cells {
-                stack.push(be_u32(page.get(c..c + 4).ok_or(Error::Malformed("child pointer"))?));
+                stack.push(be_u32(
+                    page.get(c..c + 4)
+                        .ok_or(Error::Malformed("child pointer"))?,
+                ));
             }
             stack.push(h.right_child.unwrap_or(0));
         }
@@ -159,15 +181,27 @@ pub fn entries(view: &View<'_>, pgno: u32, enc: TextEncoding) -> Result<Vec<Entr
                 let (len, q) = format::varint(page, c)?;
                 let (rowid, q) = format::varint(page, q)?;
                 let (payload, overflow) = payload(view, page, q, len, true)?;
-                out.push(Entry { rowid: Some(rowid as i64), record: format::record(&payload, enc)?, overflow });
+                out.push(Entry {
+                    rowid: Some(rowid as i64),
+                    record: format::record(&payload, enc)?,
+                    overflow,
+                });
             }
         }
         format::INDEX_LEAF | format::INDEX_INTERIOR => {
-            let skip = if h.kind == format::INDEX_INTERIOR { 4 } else { 0 };
+            let skip = if h.kind == format::INDEX_INTERIOR {
+                4
+            } else {
+                0
+            };
             for &c in &h.cells {
                 let (len, q) = format::varint(page, c + skip)?;
                 let (payload, overflow) = payload(view, page, q, len, false)?;
-                out.push(Entry { rowid: None, record: format::record(&payload, enc)?, overflow });
+                out.push(Entry {
+                    rowid: None,
+                    record: format::record(&payload, enc)?,
+                    overflow,
+                });
             }
         }
         _ => unreachable!(),
@@ -175,13 +209,25 @@ pub fn entries(view: &View<'_>, pgno: u32, enc: TextEncoding) -> Result<Vec<Entr
     Ok(out)
 }
 
-fn payload(view: &View<'_>, page: &[u8], at: usize, len: u64, table: bool) -> Result<(Vec<u8>, Vec<u32>)> {
+fn payload(
+    view: &View<'_>,
+    page: &[u8],
+    at: usize,
+    len: u64,
+    table: bool,
+) -> Result<(Vec<u8>, Vec<u32>)> {
     let usable = view.usable();
     let local = format::local_payload_size(len, usable, table);
-    let mut out = page.get(at..at + local).ok_or(Error::Malformed("payload past end"))?.to_vec();
+    let mut out = page
+        .get(at..at + local)
+        .ok_or(Error::Malformed("payload past end"))?
+        .to_vec();
     let mut overflow = Vec::new();
     if (local as u64) < len {
-        let mut next = be_u32(page.get(at + local..at + local + 4).ok_or(Error::Malformed("overflow pointer"))?);
+        let mut next = be_u32(
+            page.get(at + local..at + local + 4)
+                .ok_or(Error::Malformed("overflow pointer"))?,
+        );
         while next != 0 && (out.len() as u64) < len {
             if overflow.len() > view.commit as usize {
                 return Err(Error::Malformed("overflow chain cycle"));

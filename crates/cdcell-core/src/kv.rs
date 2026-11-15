@@ -40,8 +40,16 @@ pub struct KvValue {
 /// Decodes one `_cf_KV.v` value.
 pub fn decode(v: &Value) -> KvValue {
     match v {
-        Value::Text(t) => KvValue { value_type: KvType::LegacyText, value_json: Some(t.clone()), value_raw: t.as_bytes().to_vec() },
-        Value::Blob(b) if b.first() == Some(&0x01) => KvValue { value_type: KvType::Stub, value_json: None, value_raw: b.clone() },
+        Value::Text(t) => KvValue {
+            value_type: KvType::LegacyText,
+            value_json: Some(t.clone()),
+            value_raw: t.as_bytes().to_vec(),
+        },
+        Value::Blob(b) if b.first() == Some(&0x01) => KvValue {
+            value_type: KvType::Stub,
+            value_json: None,
+            value_raw: b.clone(),
+        },
         Value::Blob(b) => {
             let json = V8::new(b).document().ok();
             // Plain JSON values (no tags) are reported as `json`.
@@ -49,11 +57,27 @@ pub fn decode(v: &Value) -> KvValue {
                 Some(j) if !j.contains("\"$") => KvType::Json,
                 _ => KvType::V8,
             };
-            KvValue { value_type, value_json: json, value_raw: b.clone() }
+            KvValue {
+                value_type,
+                value_json: json,
+                value_raw: b.clone(),
+            }
         }
-        Value::Null => KvValue { value_type: KvType::Json, value_json: Some("null".into()), value_raw: Vec::new() },
-        Value::Integer(i) => KvValue { value_type: KvType::LegacyText, value_json: Some(i.to_string()), value_raw: Vec::new() },
-        Value::Real(f) => KvValue { value_type: KvType::LegacyText, value_json: Some(v.to_json()), value_raw: f.to_be_bytes().to_vec() },
+        Value::Null => KvValue {
+            value_type: KvType::Json,
+            value_json: Some("null".into()),
+            value_raw: Vec::new(),
+        },
+        Value::Integer(i) => KvValue {
+            value_type: KvType::LegacyText,
+            value_json: Some(i.to_string()),
+            value_raw: Vec::new(),
+        },
+        Value::Real(f) => KvValue {
+            value_type: KvType::LegacyText,
+            value_json: Some(v.to_json()),
+            value_raw: f.to_be_bytes().to_vec(),
+        },
     }
 }
 
@@ -67,7 +91,11 @@ type R<T> = std::result::Result<T, &'static str>;
 
 impl<'a> V8<'a> {
     fn new(b: &'a [u8]) -> V8<'a> {
-        V8 { b, p: 0, next_id: 0 }
+        V8 {
+            b,
+            p: 0,
+            next_id: 0,
+        }
     }
 
     fn document(&mut self) -> R<String> {
@@ -124,7 +152,13 @@ impl<'a> V8<'a> {
         let raw = self.bytes(n)?;
         Ok(match tag {
             b'"' => raw.iter().map(|&c| c as char).collect(), // Latin-1
-            b'c' => String::from_utf16_lossy(&raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<_>>()),
+            b'c' => String::from_utf16_lossy(
+                &raw.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            ),
             _ => String::from_utf8_lossy(raw).into_owned(),
         })
     }
@@ -235,7 +269,10 @@ impl<'a> V8<'a> {
                     let t = self.byte()?;
                     let pattern = self.string_body(t)?;
                     let flags = self.varint()?;
-                    format!("{{\"$regexp\":{},\"$flags\":{flags}}}", json_string(&pattern))
+                    format!(
+                        "{{\"$regexp\":{},\"$flags\":{flags}}}",
+                        json_string(&pattern)
+                    )
                 }
                 b'B' => {
                     self.id();
@@ -245,7 +282,10 @@ impl<'a> V8<'a> {
                         self.p += 1;
                         self.view(&data)?
                     } else {
-                        format!("{{\"$bytes\":\"{}\",\"$kind\":\"ArrayBuffer\"}}", base64(&data))
+                        format!(
+                            "{{\"$bytes\":\"{}\",\"$kind\":\"ArrayBuffer\"}}",
+                            base64(&data)
+                        )
                     }
                 }
                 b'^' => format!("{{\"$ref\":{}}}", self.varint()?),
@@ -260,7 +300,11 @@ impl<'a> V8<'a> {
         while self.peek()? != end {
             let k = self.value()?;
             let v = self.value()?;
-            let key = if k.starts_with('"') { k } else { json_string(&k) };
+            let key = if k.starts_with('"') {
+                k
+            } else {
+                json_string(&k)
+            };
             props.push(format!("{key}:{v}"));
         }
         self.p += 1;
@@ -293,7 +337,10 @@ impl<'a> V8<'a> {
             self.varint()?;
         }
         let data = buffer.get(offset..offset + len).ok_or("view past buffer")?;
-        Ok(format!("{{\"$bytes\":\"{}\",\"$kind\":\"{kind}\"}}", base64(data)))
+        Ok(format!(
+            "{{\"$bytes\":\"{}\",\"$kind\":\"{kind}\"}}",
+            base64(data)
+        ))
     }
 
     fn bigint(&mut self) -> R<String> {
@@ -302,11 +349,14 @@ impl<'a> V8<'a> {
         let n = (bitfield >> 1) as usize;
         let digits = self.bytes(n)?;
         // little-endian magnitude → decimal
-        let mut limbs: Vec<u32> = digits.chunks(4).map(|c| {
-            let mut b = [0u8; 4];
-            b[..c.len()].copy_from_slice(c);
-            u32::from_le_bytes(b)
-        }).collect();
+        let mut limbs: Vec<u32> = digits
+            .chunks(4)
+            .map(|c| {
+                let mut b = [0u8; 4];
+                b[..c.len()].copy_from_slice(c);
+                u32::from_le_bytes(b)
+            })
+            .collect();
         let mut out = Vec::new();
         while limbs.iter().any(|&l| l != 0) {
             let mut rem = 0u64;
@@ -359,7 +409,13 @@ fn iso8601(ms: f64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3_600_000, rem / 60_000 % 60, rem / 1000 % 60, rem % 1000)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
 }
 
 #[cfg(test)]
@@ -384,12 +440,18 @@ mod tests {
     #[test]
     fn objects_dates_maps() {
         // {a: 1} then end-object with 1 property
-        assert_eq!(j(&[0xff, 0x0f, b'o', b'"', 1, b'a', b'I', 2, b'{', 1]), "{\"a\":1}");
+        assert_eq!(
+            j(&[0xff, 0x0f, b'o', b'"', 1, b'a', b'I', 2, b'{', 1]),
+            "{\"a\":1}"
+        );
         let mut d = vec![0xff, 0x0f, b'D'];
         d.extend_from_slice(&0f64.to_le_bytes());
         assert_eq!(j(&d), "{\"$date\":\"1970-01-01T00:00:00.000Z\"}");
         // Map {1 => 'x'}
-        assert_eq!(j(&[0xff, 0x0f, b';', b'I', 2, b'"', 1, b'x', b':', 2]), "{\"$map\":[[1,\"x\"]]}");
+        assert_eq!(
+            j(&[0xff, 0x0f, b';', b'I', 2, b'"', 1, b'x', b':', 2]),
+            "{\"$map\":[[1,\"x\"]]}"
+        );
         // BigInt -5: bitfield = (1 byte << 1) | sign... digits length 1 → bitfield = 1<<1 | 1 = 3
         assert_eq!(j(&[0xff, 0x0f, b'Z', 3, 5]), "{\"$bigint\":\"-5\"}");
     }
@@ -397,6 +459,9 @@ mod tests {
     #[test]
     fn stubs_and_legacy() {
         assert_eq!(decode(&Value::Blob(vec![1, 2, 3])).value_type, KvType::Stub);
-        assert_eq!(decode(&Value::Text("{\"a\":1}".into())).value_type, KvType::LegacyText);
+        assert_eq!(
+            decode(&Value::Text("{\"a\":1}".into())).value_type,
+            KvType::LegacyText
+        );
     }
 }
