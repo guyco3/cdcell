@@ -23,20 +23,20 @@ history can be coarser than every capture.
 
 | Property | Guarantee |
 |---|---|
-| Validity | Every emitted version `(epoch, txid)` is a state the cell really had in its restorable history (a prefix of its history). Versions may be skipped. No version is a state that never existed; no phantom (fenced-node) write ever appears. |
+| Validity | Every emitted version `(epoch, txid)` is a state the cell really had in its restorable history (a prefix of its history). Versions may be skipped. No version is a state that never existed; no phantom (fenced-node) write ever appears. No exception: cdcell reads only per-cell objects, confirmed by `own.json` (D5, D6). |
 | Order | `(__epoch, __txid)`, compared as a pair, is a total order. Epochs only increase (A6). TXIDs restart only at an epoch boundary: snapshot epochs restart at 1 (D1), paged epochs continue at cut+1 (D2). So `(3, 900) < (4, 1)`. |
 | Consistent views | All tables of one cell at one version come from the same database state (§1.1). |
 | Exactly once | The rows of a committed batch appear once (§3.3). Only the fallback resync may restate rows, as one net change. |
 | Grain | Best effort (§4). |
+| Freshness | A change reaches the lake once it is in a per-cell object: after a fold (`CELLD_LTX_COMPACTION_MIN_TXIDS` captures or 32 MiB) or a drain (eviction, handoff, recovery), then the next run. A quiet cell that stays resident can wait until its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds this (idle eviction writes the cell's changes to a per-cell object); the next activation starts a new epoch, so history across that restart is coarser (§4). |
 
 Ordering and consistency are per Durable Object, matching the Durable
 Object model (objects are independent; there are no cross-object
 transactions).
 
-Live-tail rows (bundle rows, fleet mode) are confirmed by a celld behavior,
-not a guarantee (C12). If a later paged cut shows that a confirmed tail row
-was not history, the cell is resynced as one net change and counted
-(§2.2). `CDCELL_TAIL=off` does not use bundle rows.
+The optional live tail (`CDCELL_TAIL=on`, §2.4) trades strict validity for
+freshness. With it on, validity holds except a rare case that is detected
+and self-corrects (`cdcell_tail_rollback_total`).
 
 ### 1.1 Reading a consistent view
 
@@ -76,8 +76,8 @@ can see every statement.
 
 **Run interval** is a setting: `CDCELL_RUN_INTERVAL` (default `3h`) for the
 long-running mode, or the customer's own schedule calling `cdcell run
---once`. Shorter intervals give fresher data and, in fleet mode, more
-per-capture rows from the live tail; longer ones give fewer, larger files.
+--once`. Shorter intervals give fresher data (and, with the opt-in live
+tail, more per-capture rows); longer ones give fewer, larger files.
 
 ## 2. Where a run left off: cursors and partitions
 
@@ -92,9 +92,10 @@ independently.
 (default 16). Partitions are the unit of planning, GETs, decoding and
 staging data files. Each has:
 - a checkpoint shard (`_cdcell/p<k>/checkpoint.json`): cell → cursor,
-  durable boundary, snapshot and journal keys (§2.3);
+  durable boundary and snapshot keys (§2.3; journal keys with the tail on);
 - a pending set (`_cdcell/p<k>/pending.json`): keys of parked or failed
-  cells and the bundle rows they still need, carried to the next run.
+  cells, carried to the next run (with the tail on, also the bundle rows
+  they still need).
 
 Partitions do not lease, fence or commit. One committer per run commits all
 partitions' staged work (§3). Doubling P splits every hash range in two;
@@ -104,29 +105,28 @@ shards and pending sets.
 ### 2.1 Finding the cells to process ("dirty cells")
 
 A **message broker** is the only discovery mechanism. celld's bucket sends a
-notification for every object created under `cells/` and under `log/` to the
-broker (SQS, Kafka, JetStream, …; any works, §7), at least once (§8).
-Ordering is not required: keys are sorted per cell before planning. Rules filter to `.ltx` and
-`.ltxb` keys (G5); anything else that slips through (`own.json`,
-`retired.json`) is dropped.
+notification for every object created under `cells/` to the broker (SQS,
+Kafka, JetStream, …; any works, §7), at least once (§8). Ordering is not
+required: keys are sorted per cell before planning. Rules filter to `.ltx`
+keys (G5); anything else that slips through (`own.json`, `retired.json`) is
+dropped.
 
 | Source | What it gives | Cost | When |
 |---|---|---|---|
 | **Per-cell notifications** (`cells/`) | the exact new per-cell object keys | one message per celld per-cell object | every run |
-| **Bundle notifications** (`log/`) for the live tail | bundle keys with not-yet-folded rows | one message and one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s), most of them 404 by run time; plus node lease GETs | every run in fleet mode (`CDCELL_TAIL=off` skips bundles; bundle notifications are then not needed) |
+| **Bundle notifications** (`log/`) | bundle keys with not-yet-folded rows | see §2.4 | only with `CDCELL_TAIL=on` (§2.4) |
 
 - A run drains the broker once, splits the keys by partition, writes them
   to `_cdcell/p<k>/dirty/<run>.json`, then acknowledges them, so no broker
   setting has to outlast a run. Each partition's work is its dirty list
   plus its pending set.
-- Bundle keys do not say which cells they hold, so the run GETs bundles
-  once, centrally, and splits their rows into per-partition row lists. A
-  404 means celld already covered and GC'd that bundle; its rows are in
-  per-cell objects, which are notified too. Node leases are read (GET) for
-  confirmation (§2.2).
-- Why the live tail matters: in fleet mode a quiet cell that stays resident
-  can keep fewer than a fold's captures in bundles until it is evicted
-  (C7), so per-cell objects alone give it no freshness bound.
+- Freshness: a cell's changes are found once they are in a per-cell object,
+  after a fold or a drain (eviction, handoff, recovery). A quiet cell that
+  stays resident keeps fewer than a fold's captures in bundles (C7) and can
+  wait until its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds the
+  wait: idle eviction writes the cell's changes to a per-cell object. The
+  next activation starts a new epoch, so history across that restart is
+  coarser (§4). The opt-in live tail (§2.4) is the other way.
 - Cells that existed before cdcell was deployed and never write again are
   not exported: no notification ever names them. A one-time, operator-run
   `cdcell backfill` is planned (§11).
@@ -162,9 +162,9 @@ LISTs in different runs, the cell is parked (metric
 `cdcell_cell_parked{reason="hole"}`) and stops LISTing. It resumes when a
 later epoch's opener arrives in the broker, with one net change (§2.2).
 
-**Late, lost and out-of-order notifications.** Every capture's content is in
-the bucket (first a bundle row, then inside a per-cell object), even though a
-TXID does not keep a file of its own once folded.
+**Late, lost and out-of-order notifications.** Every capture's content ends
+up inside a per-cell object, even though a TXID does not keep a file of its
+own once folded.
 
 | Case | Handling |
 |---|---|
@@ -173,70 +173,96 @@ TXID does not keep a file of its own once folded.
 | Missing at the end (broker has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
 | Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§8). |
-| Owner restarted into a snapshot epoch before the run read the old tail | The old epoch's unproven tail and the new epoch's first writes become one net change at the opener (§4). |
+| Owner restarted into a snapshot epoch before the run read the old epoch's last objects | Those unproven objects and the new epoch's first writes become one net change at the opener (§4). |
 
 ### 2.2 Planning one cell
 
 Inputs: cursor `(E, t)`; the cell's objects past it (broker, or a LIST under
-§2.1); its live bundle rows from the run's split.
+§2.1); with the tail on, its bundle rows from the run's split (§2.4).
 
-1. **GET** the units the plan needs (step 3), **then read `own.json`** and
-   the node leases of bundle rows. That order is the confirmation rule
-   (a successor CASes the record before reading data, D5, D6):
+1. **GET** the units the plan needs (step 3), **then read `own.json`** (and,
+   with the tail on, the node leases of bundle rows). That order is the
+   confirmation rule (a successor CASes the record before reading data, D5,
+   D6):
    - per-cell object in epoch `E'`: history if `own.epoch == E'`, or if a
      later paged epoch's marker `(c+1)-(c+1)` proves the cut (D2) and the
      object ends at or below `c`. Files can land in `E'` after `own.json`
      moved on (D10): that makes them unproven, not phantom;
-   - bundle row: history if the node is on the same generation with its log
-     open at an epoch ≥ the bundle's (C12, behavior).
+   - bundle row (tail on only): see §2.4.
 
    A full image proves no cut (D1). A snapshot epoch's TXID-1 image is
    diffed against the state at the last proven point, and the difference is
    emitted as one net change at `(E'', 1)`. Unproven units wait for the
    next run; the cell stops at its last proven point (`parked`).
-2. **Finest chain:** objects overlap (L0s and L1s of one range, bundle rows
-   over both). Pick the path from `t` to the proven head with the most
-   steps (dynamic programming over TXID positions). `CDCELL_GRAIN=fold`
-   picks the fewest steps instead (cheapest).
+2. **Finest chain:** objects overlap (L0s and L1s of one range; with the
+   tail on, bundle rows over both). Pick the path from `t` to the proven
+   head with the most steps (dynamic programming over TXID positions).
+   `CDCELL_GRAIN=fold` picks the fewest steps instead (cheapest).
 3. **Apply** in order to the cell state and decode each step into rows. A
    range `a..b` with `a ≤ t+1 ≤ b` applies exactly: LTX pages are full page
    images, so the state at `t` plus the range's pages is the state at `b`,
    and the decoder emits the net change from `t` to `b`.
 
-**Cursor above a later cut.** If a paged marker proves a cut `c` below a
-cursor that came from a confirmed bundle row, those rows were not history.
-The cell is rebuilt to `c` and resynced as one net change, with metric
-`cdcell_tail_rollback_total`. This relies on C12 being true almost always;
-it is not expected in a healthy fleet.
-
 ### 2.3 Cell state between runs
 
-Decoding needs the cell's pages at its cursor. cdcell keeps:
+Decoding needs the cell's pages at its cursor. Without the tail, the cursor
+always lies on a per-cell object boundary (the **durable boundary**), so the
+state there is a snapshot, or is rebuilt from celld's objects (newest full
+image plus objects), since celld keeps them. cdcell keeps:
 
-- the **durable boundary**: the last cursor point that is the end of a
-  per-cell object. The state there can always be rebuilt from celld's
-  objects (newest full image plus objects), since celld keeps them;
-- the **tail journal** (`<state>/<cell>/journal/<epoch>-<from>-<to>.ltx`):
-  the raw LTX bytes of confirmed bundle rows applied since the durable
-  boundary. Small, because it only spans the not-yet-folded tail. State at
-  the cursor = state at the boundary + journal;
 - an optional **cell snapshot** (`<state>/<cell>/<epoch>-<txid>.zst`, zstd
   SQLite pages, immutable): a cache, written only when the replay from the
   newest snapshot or full image would exceed `CDCELL_SNAPSHOT_EVERY`
   objects (default 8). A PUT costs about 12× a GET.
 
-Journals and snapshots older than the newest boundary and snapshot are
-deleted after the commit. `--every` mode also keeps recently used states in
-memory (bounded by `CDCELL_STATE_CACHE_MB`).
+Snapshots older than the newest one are deleted after the commit. The tail
+journal exists only with the tail on (§2.4). `--every` mode also keeps
+recently used states in memory (bounded by `CDCELL_STATE_CACHE_MB`).
 
 `<state>` is `CDCELL_STATE_URL`, a prefix or bucket separate from the
-Iceberg data, with its own IAM and KMS key. Snapshots and journals hold
+Iceberg data, with its own IAM and KMS key. Snapshots (and journals) hold
 whole SQLite pages: internal tables and freelist residue that the change
 log never exposes.
 
 Bootstrap (a new cell): the newest full image of the owner's chain is
 emitted as `r` rows. Full-history bootstrap from the oldest epoch is a
 later option.
+
+### 2.4 Optional live tail (`CDCELL_TAIL=on`)
+
+Off by default. It reads rows celld has not folded yet, from bundles under
+`log/`.
+
+**What it does.** Each run GETs the notified bundle keys still in the
+bucket. A 404 means celld already folded and GC'd that bundle; its rows are
+in per-cell objects, which are notified too. Bundle keys do not say which
+cells they hold, so `plan` GETs bundles once, centrally, and splits their
+rows into per-partition row files. A bundle row is confirmed as history if
+its node is on the same generation with its log open at an epoch ≥ the
+bundle's (node lease GET after the data GET). This is a celld behavior, not
+a guarantee (C12).
+
+**What it buys.** Quiet resident cells are fresh every run, and rows still
+in bundles give per-capture versions (§4).
+
+**What it costs.**
+- bundle notifications under `log/` (suffix `.ltxb`, §8), one message and
+  one GET per bundle (one per node per `CELLD_LOG_FLUSH_MS`, default 2 s),
+  most of them 404 by run time;
+- node lease GETs every run;
+- a **tail journal** per cell (`<state>/<cell>/journal/<epoch>-<from>-<to>.ltx`):
+  the raw LTX bytes of confirmed bundle rows applied since the durable
+  boundary, required whenever a cursor ends in tail rows (a journal PUT).
+  State at the cursor = state at the boundary + journal. Small, because it
+  only spans the not-yet-folded rows; superseded journals are deleted after
+  the commit.
+
+**Caveat and self-correction.** If a later paged marker proves a cut `c`
+below a cursor that came from a confirmed bundle row, those rows were not
+history: cdcell emitted versions that never existed. The cell is rebuilt to
+`c` and resynced as one net change, with metric
+`cdcell_tail_rollback_total`. This relies on C12 being true almost always;
+it is not expected in a healthy fleet.
 
 ## 3. Batches: one committer, idempotent
 
@@ -257,11 +283,12 @@ property, last writer wins) would race too.
    holder commits an empty snapshot to the fence branch (§3.4) and
    remembers its id.
 2. **Roll forward** any batch committed after the last checkpoint (§3.3).
-3. **Drain** the broker and split bundles (§2.1). Record `planned_at` and the
-   batch seq in `_cdcell/batches/<seq>.json` (create-only).
+3. **Drain** the broker (§2.1); with the tail on, split bundles (§2.4).
+   Record `planned_at` and the batch seq in `_cdcell/batches/<seq>.json`
+   (create-only).
 4. **Process partitions concurrently:** plan, GET, confirm, apply, decode;
-   write journals and snapshots; stage Parquet at deterministic paths
-   (`…/data/<partition values>/b<seq>-p<k>-<n>.parquet`), rows sorted by
+   write snapshots (and journals, tail on); stage Parquet at deterministic
+   paths (`…/data/<partition values>/b<seq>-p<k>-<n>.parquet`), rows sorted by
    the table sort order. Each partition writes its plan
    `_cdcell/batches/<seq>/p<k>.json` (cells, from, to, staged files)
    create-only; the committer reads these (works across machines, §3.2). `__ingested_at` is
@@ -273,7 +300,7 @@ property, last writer wins) would race too.
    registry visibility (`cdcell.schemas`) is updated here. A partition that
    meets a new shape evolves the table itself before staging (§3.2).
 6. **Finish:** checkpoint shards and pending sets; delete the consumed
-   dirty lists and superseded journals and snapshots.
+   dirty lists and superseded snapshots (and journals).
 
 ### 3.2 Scaling out: plan, stage, commit
 
@@ -281,7 +308,7 @@ Each Durable Object's work needs only its own objects: a 1:1 map, no joins
 or shuffles. So a run splits into three steps any runner can execute:
 
 ```
-cdcell plan                 lease, fence, roll forward, drain the broker, split bundles;
+cdcell plan                 lease, fence, roll forward, drain the broker (tail on: split bundles);
                             writes the run plan: batch seq, planned_at, partitions → tasks
 cdcell stage --task <i>     N in parallel: decode the task's partitions, write cell state
                             and Parquet, write p<k>.json per partition (staged files)
@@ -289,18 +316,19 @@ cdcell commit               read every p<k>.json; one atomic commit with the fen
 ```
 
 - **Only `plan` reads the broker.** It drains it with concurrent pollers,
-  writes the keys per partition (`_cdcell/runs/<seq>/p<k>/keys.json`), GETs
-  and splits bundles into per-partition row files (a bundle mixes cells of
-  many partitions, so this happens once, centrally), and acknowledges the
-  messages only after those files are written. Stage tasks read their
+  writes the keys per partition (`_cdcell/runs/<seq>/p<k>/keys.json`), and
+  acknowledges the messages only after those files are written. With the
+  tail on, it also GETs and splits bundles into per-partition row files
+  (§2.4). Stage tasks read their
   partitions' files from the state prefix: no competing consumers, no
   visibility timeout or ack deadline spanning a run, no ordering needed.
   Files of a failed run stay as the pending set; the next `plan` merges
   them with new messages.
 - **Customers do not partition their broker.** S3 notifications filter only
   by prefix/suffix (no hashing), so one ordinary broker receives everything
-  and `plan` does the partitioning. The broker carries folds and bundles,
-  not captures, so one drainer keeps up; if it ever does not, `plan` runs
+  and `plan` does the partitioning. The broker carries per-cell objects (and
+  bundles with the tail on), not captures, so one drainer keeps up; if it
+  ever does not, `plan` runs
   several pollers on the same broker (SQS and JetStream allow concurrent
   consumers). A Kafka/Kinesis adapter whose topic is keyed by cell id
   (customer-routed) could let stage tasks read their own partitions; later.
@@ -356,7 +384,7 @@ need no data files; success is 200 with an empty body.
 
 | Goal | celld setting | Grain |
 |---|---|---|
-| Current state, coarse history | defaults | one version per fold (≥ 256 captures or 32 MiB) while a cell stays active between runs; live-tail rows per capture |
+| Current state, coarse history | defaults | one version per fold (≥ 256 captures or 32 MiB) while a cell stays active between runs; with `CDCELL_TAIL=on`, per capture for rows still in bundles (§2.4) |
 | Finer history | lower `CELLD_LTX_COMPACTION_MIN_TXIDS` (16-64) | per that many captures; more celld PUTs, slower takeovers |
 | Finer history, bucket mode | `CELLD_DURABILITY=bucket` | per upload pass, usually per capture (under backlog `sync_cell` merges the TXIDs since the last upload into one L0); write acks wait for S3 |
 | Every event | insert-only events table in the app | exact |
@@ -366,12 +394,17 @@ database under `CELLD_LTX_PAGED_MIN_MB` (default 256 MiB) gets a snapshot
 epoch: it opens with a TXID-1 full image that already holds the first new
 writes, and nothing records which TXID of the old epoch was restored (D1).
 Read hours later, after `own.json` moved on, the old epoch's last objects
-cannot be proven. So the old epoch's unproven tail and the new epoch's
-first writes collapse into one net change at the new opener: across a
-restart between runs, one version per activation for the unproven part.
-With `CELLD_IDLE_EVICT_S` or frequent deploys this is common. Paged epochs
+cannot be proven. So those unproven objects and the new epoch's first
+writes collapse into one net change at the new opener: across a restart
+between runs, one version per activation for the unproven part. With
+`CELLD_IDLE_EVICT_S` or frequent deploys this is common. Paged epochs
 (≥ 256 MiB) carry the cut (D2) and keep their grain. Shorter run intervals
-and the live tail reduce the unproven part.
+and the opt-in live tail reduce the unproven part.
+
+**Freshness vs grain.** Without the tail, a quiet resident cell's changes
+reach the lake at its next fold or eviction. `CELLD_IDLE_EVICT_S` bounds
+that wait, at the cost above: each idle eviction is a restart, so history
+across it is coarser.
 
 Later: on a versioned bucket, GC'd bundles stay readable as noncurrent
 versions, which gives per-capture history without bucket mode. That needs
@@ -444,10 +477,11 @@ commit; the run retries (§3.3).
 
 | Item | Requests |
 |---|---|
-| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a journal PUT when the cursor ends in tail rows; a snapshot PUT only per `CDCELL_SNAPSHOT_EVERY` |
+| Per dirty cell | 1 `own.json` GET; 1 GET per new celld object on the chain (by default one per fold); a snapshot GET unless cached; a snapshot PUT only per `CDCELL_SNAPSHOT_EVERY` |
 | Per LISTing cell | gap: 3 LISTs (L0, L1, L9); epoch change: 1 delimiter LIST plus 3 per walked epoch. Epoch changes are routine (A6), so expect this for cells restarted since the last run |
-| Per run | the broker drain; one GET per notified bundle key, most 404, split centrally (fleet); node lease GETs; one lease write; one catalog transaction (or a few for a huge run) |
+| Per run | the broker drain; one lease write; one catalog transaction (or a few for a huge run) |
 | Per batch | one Parquet file per (table, day) |
+| Tail on only (§2.4) | per run: one GET per notified bundle key (most 404), node lease GETs; per cell: a journal PUT when the cursor ends in tail rows |
 
 Compared with revision 5:
 - no read per capture;
@@ -513,10 +547,9 @@ Engines such as Spark belong on the consumer side, if the customer has one
    --once`); or one long-running `cdcell run` that repeats every
    `CDCELL_RUN_INTERVAL` (default `3h`; any duration, e.g. `15m` or `24h`).
 4. Required: notifications of every object created under `cells/` (suffix
-   `.ltx`) and under `log/` (suffix `.ltxb`) to a message broker (SQS or JetStream),
-   at least once, as S3 delivers (G2, G5). `log/` is not needed with
-   `CDCELL_TAIL=off`. A lost notification is a setup fault (G3), not a
-   cdcell bug.
+   `.ltx`) to a message broker (SQS or JetStream), at least once, as S3
+   delivers (G2, G5). With `CDCELL_TAIL=on`, also under `log/` (suffix
+   `.ltxb`). A lost notification is a setup fault (G3), not a cdcell bug.
 5. Broker retention longer than cdcell's longest outage (SQS up to 14 days;
    JetStream `max_age`). Without it, a quiet cell's final objects may never
    be exported: no later write reveals the gap.
@@ -535,8 +568,8 @@ carries over: tests enqueue notifications, then call `run_once`.
 
 ## 10. To verify or build before shipping
 
-1. Freshness of quiet resident cells with the live tail on and off in fleet
-   mode (e2e).
+1. Freshness of quiet resident cells with `CELLD_IDLE_EVICT_S` and without;
+   tail on vs off (e2e).
 2. celld with `CELLD_LTX_COMPACTION_MIN_TXIDS=16`: write-path and takeover
    cost.
 3. The finest-chain planner against every overlap celld produces (merged
@@ -553,6 +586,7 @@ carries over: tests enqueue notifications, then call `run_once`.
 - `cdcell backfill`: a one-time command the operator runs at install. It
   LISTs `cells/` once and exports cells that existed before cdcell and
   never write again. It is a manual command, not part of runs.
+- The live tail (§2.4): opt-in, built after the default path.
 - Multi-container workers with one committer per partition. Concurrent
   commits to shared tables conflict on sequence numbers (§3), so this needs
   the rebase-retry of §3.3 on every commit and serialized schema updates.
