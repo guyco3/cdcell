@@ -400,4 +400,233 @@ mod tests {
         d.reverse();
         assert_eq!(best_path(&d, 0, None, Grain::Fold), want);
     }
+
+    // ---- Adversarial cases (PR #11 review) ----
+
+    #[test]
+    fn epoch_chain_l9_only_top_epoch_is_the_whole_chain() {
+        let e1 = [o(1, 0, 1, 50)];
+        let e2 = [o(2, 9, 1, 30)];
+        assert_eq!(chain(&[(1, &e1), (2, &e2)]), Some(vec![ce(2, 1, &e2)]));
+    }
+
+    #[test]
+    fn epoch_chain_marker_only_epochs() {
+        // A paged activation that wrote only its marker `m-m` and was
+        // evicted before any write, twice over.
+        let e1 = [o(1, 0, 1, 20)];
+        let e2 = [o(2, 0, 21, 21)];
+        let e3 = [o(3, 0, 22, 22)];
+        let e4 = [o(4, 0, 23, 23), o(4, 0, 24, 30), o(4, 1, 23, 30)];
+        assert_eq!(
+            chain(&[(1, &e1), (2, &e2), (3, &e3), (4, &e4)]),
+            Some(vec![
+                ce(1, 1, &e1),
+                ce(2, 21, &e2),
+                ce(3, 22, &e3),
+                ce(4, 23, &[o(4, 0, 23, 23), o(4, 0, 24, 30), o(4, 1, 23, 30)]),
+            ])
+        );
+        // A marker-only newest epoch.
+        assert_eq!(
+            chain(&[(1, &e1), (2, &e2)]),
+            Some(vec![ce(1, 1, &e1), ce(2, 21, &e2)])
+        );
+    }
+
+    #[test]
+    fn epoch_chain_link_with_inner_gap_still_links() {
+        // celld only checks the clipped end: a hole inside the link is the
+        // planner's problem (best_path stops at it), not the chain's.
+        let e1 = [o(1, 0, 1, 5), o(1, 0, 10, 20)];
+        let e2 = [o(2, 0, 21, 25)];
+        let got = chain(&[(1, &e1), (2, &e2)]).unwrap();
+        assert_eq!(got, vec![ce(1, 1, &e1), ce(2, 21, &e2)]);
+        let objs: Vec<Obj> = got.into_iter().flat_map(|c| c.objs).collect();
+        assert_eq!(best_path(&objs, 0, None, Grain::Finest).reach, 5);
+    }
+
+    #[test]
+    fn epoch_chain_object_straddling_cut_breaks_link() {
+        // e1's only object reaching the cut runs past it: clipped away, the
+        // rest ends at 10, not 20, so e1 is not the link (celld: same).
+        let e1 = [o(1, 0, 1, 10), o(1, 1, 11, 30)];
+        let e2 = [o(2, 0, 21, 25)];
+        assert_eq!(chain(&[(1, &e1), (2, &e2)]), Some(vec![ce(2, 21, &e2)]));
+        // The clipped set ends one short of the cut: not the link either.
+        let e1 = [o(1, 0, 1, 19)];
+        assert_eq!(chain(&[(1, &e1), (2, &e2)]), Some(vec![ce(2, 21, &e2)]));
+        // Duplicate range at another level, ending exactly at the cut.
+        let e1 = [o(1, 0, 1, 20), o(1, 1, 1, 20), o(1, 9, 1, 20)];
+        assert_eq!(
+            chain(&[(1, &e1), (2, &e2)]),
+            Some(vec![ce(1, 1, &e1), ce(2, 21, &e2)])
+        );
+    }
+
+    #[test]
+    fn epoch_chain_duplicates_and_input_order() {
+        let e1 = [
+            o(1, 1, 1, 20),
+            o(1, 0, 11, 20),
+            o(1, 0, 1, 10),
+            o(1, 0, 1, 10),
+        ];
+        assert_eq!(
+            chain(&[(1, &e1)]),
+            Some(vec![ce(
+                1,
+                1,
+                &[o(1, 0, 1, 10), o(1, 0, 11, 20), o(1, 1, 1, 20)]
+            )])
+        );
+    }
+
+    #[test]
+    fn epoch_chain_many_epochs_walk_back() {
+        // 200 paged epochs of one TXID each over a snapshot epoch, with a
+        // fenced late snapshot in every tenth epoch (skipped).
+        let mut map = BTreeMap::new();
+        map.insert(1, vec![o(1, 9, 1, 100)]);
+        let mut want = vec![ce(1, 1, &[o(1, 9, 1, 100)])];
+        let mut t = 100;
+        let mut epoch = 1;
+        for i in 0..200 {
+            epoch += 1;
+            if i % 10 == 5 {
+                map.insert(epoch, vec![o(epoch, 9, 1, t - 1)]);
+                epoch += 1;
+            }
+            t += 1;
+            map.insert(epoch, vec![o(epoch, 0, t, t)]);
+            want.push(ce(epoch, t, &[o(epoch, 0, t, t)]));
+        }
+        assert_eq!(epoch_chain(&map), Some(want));
+    }
+
+    #[test]
+    fn epoch_chain_txid_extremes_do_not_panic() {
+        // A link ending at u64::MAX - 1, continued at u64::MAX.
+        let e1 = [o(1, 0, 1, u64::MAX - 1)];
+        let e2 = [o(2, 0, u64::MAX, u64::MAX)];
+        assert_eq!(
+            chain(&[(1, &e1), (2, &e2)]),
+            Some(vec![ce(1, 1, &e1), ce(2, u64::MAX, &e2)])
+        );
+        // An object starting at TXID 0 (celld never writes one): lo 0 has
+        // no cut below it, so nothing below can link; no underflow.
+        let e1 = [o(1, 0, 1, 5)];
+        let e2 = [o(2, 0, 0, 7)];
+        assert_eq!(chain(&[(1, &e1), (2, &e2)]), Some(vec![ce(2, 0, &e2)]));
+        // Epoch numbers at both ends.
+        let lo = [o(0, 0, 1, 5)];
+        let hi = [o(u64::MAX, 0, 6, 9)];
+        assert_eq!(
+            chain(&[(0, &lo), (u64::MAX, &hi)]),
+            Some(vec![ce(0, 1, &lo), ce(u64::MAX, 6, &hi)])
+        );
+    }
+
+    #[test]
+    fn best_path_finest_prefers_reach_over_steps() {
+        // Three steps reach 6; four steps (the same three, then the fold)
+        // reach 10. Reach always wins, then steps.
+        let objs = [o(1, 0, 1, 2), o(1, 0, 3, 4), o(1, 0, 5, 6), o(1, 1, 1, 10)];
+        assert_eq!(best_path(&objs, 0, None, Grain::Finest), path(&objs, 10));
+        assert_eq!(best_path(&objs, 0, None, Grain::Fold), path(&objs[3..], 10));
+        // A limit below the fold: the L0s only.
+        assert_eq!(
+            best_path(&objs, 0, Some(9), Grain::Finest),
+            path(&objs[..3], 6)
+        );
+    }
+
+    #[test]
+    fn best_path_from_beyond_and_inside() {
+        let objs = [o(1, 0, 1, 5), o(1, 1, 1, 256), o(1, 0, 6, 300)];
+        // Beyond every object.
+        assert_eq!(best_path(&objs, 1000, None, Grain::Finest), path(&[], 1000));
+        // At an end: nothing ending there is reused.
+        assert_eq!(
+            best_path(&objs, 256, None, Grain::Finest),
+            path(&objs[2..], 300)
+        );
+        // Inside the straddling L1 and the L0 6-300 alike: Finest takes both.
+        assert_eq!(
+            best_path(&objs, 100, None, Grain::Finest),
+            path(&objs[1..], 300)
+        );
+        assert_eq!(
+            best_path(&objs, 100, None, Grain::Fold),
+            path(&objs[2..], 300)
+        );
+        // A limit at or below `from`: nothing to do.
+        for limit in [0, 99, 100] {
+            assert_eq!(
+                best_path(&objs, 100, Some(limit), Grain::Finest),
+                path(&[], 100)
+            );
+        }
+    }
+
+    #[test]
+    fn best_path_txid_extremes() {
+        let top = u64::MAX;
+        let objs = [
+            o(1, 0, 0, top),
+            o(1, 0, top - 1, top - 1),
+            o(1, 0, top, top),
+        ];
+        assert_eq!(best_path(&objs, top, None, Grain::Finest), path(&[], top));
+        assert_eq!(
+            best_path(&objs, top - 2, None, Grain::Finest),
+            // Two steps either way from top-1; `0-top` is first in Obj order.
+            path(&[o(1, 0, top - 1, top - 1), o(1, 0, 0, top)], top)
+        );
+        assert_eq!(
+            best_path(&objs, top - 2, None, Grain::Fold),
+            path(&[o(1, 0, 0, top)], top)
+        );
+        assert_eq!(
+            best_path(&objs, 0, Some(top - 1), Grain::Fold),
+            path(&[], 0)
+        );
+    }
+
+    #[test]
+    fn best_path_ignores_inverted_and_duplicate_objects() {
+        let objs = [o(1, 0, 5, 1), o(1, 0, 1, 5), o(1, 0, 1, 5), o(1, 0, 6, 6)];
+        assert_eq!(
+            best_path(&objs, 0, None, Grain::Finest),
+            path(&[o(1, 0, 1, 5), o(1, 0, 6, 6)], 6)
+        );
+    }
+
+    #[test]
+    fn best_path_equal_reach_across_epochs_and_levels() {
+        // The same range in two epochs and two levels (only possible
+        // outside a chain): the lowest epoch, then level, wins.
+        let objs = [o(2, 0, 1, 9), o(1, 1, 1, 9), o(1, 2, 1, 9), o(2, 1, 1, 9)];
+        for grain in [Grain::Finest, Grain::Fold] {
+            assert_eq!(best_path(&objs, 0, None, grain), path(&[o(1, 1, 1, 9)], 9));
+        }
+    }
+
+    #[test]
+    fn best_path_large_history_is_fast_and_finest() {
+        // 20 000 single-TXID L0s, an L1 per 256, a drain L0 over all of
+        // them from 1, and recovery L0s duplicating every tenth L0.
+        let n = 20_000u64;
+        let mut objs: Vec<Obj> = (1..=n).map(|t| o(1, 0, t, t)).collect();
+        objs.extend((0..n / 256).map(|i| o(1, 1, i * 256 + 1, (i + 1) * 256)));
+        objs.push(o(1, 0, 1, n + 1));
+        objs.extend((1..=n).step_by(10).map(|t| o(1, 2, t, t)));
+        let t0 = std::time::Instant::now();
+        let finest = best_path(&objs, 0, None, Grain::Finest);
+        let fold = best_path(&objs, 0, None, Grain::Fold);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(finest.reach, n + 1);
+        assert_eq!(finest.steps.len() as u64, n + 1);
+        assert_eq!(fold, path(&[o(1, 0, 1, n + 1)], n + 1));
+    }
 }

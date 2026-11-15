@@ -388,3 +388,292 @@ fn generators_cover_links_skips_and_restores() {
         "links {links} skips {skips} clipped {clipped} restores {restores}"
     );
 }
+
+// ---- Adversarial generators (PR #11 review) ----
+//
+// The generators above build histories the way celld does; these build
+// listings with no such discipline (many epochs, marker-only and L9-only
+// epochs, holes, the same range at several levels, single-TXID objects,
+// levels celld never lists) and still demand celld's answer.
+
+/// One epoch's shape, relative to the ends of the epochs below it.
+#[derive(Clone, Debug)]
+enum Wild {
+    Empty,
+    /// A paged marker `m-m` after an end of the epoch `back` below.
+    Marker {
+        back: usize,
+        k: usize,
+    },
+    /// Only an L9 `1-max`.
+    L9 {
+        max: u64,
+    },
+    /// Arbitrary objects; `after` anchors the first at an earlier end + 1.
+    Objs {
+        after: Option<(usize, usize)>,
+        objs: Vec<(u32, u64, u64)>,
+    },
+}
+
+fn arb_wild() -> impl Strategy<Value = Wild> {
+    let level = prop_oneof![
+        5 => Just(0u32), 3 => Just(1u32), 1 => Just(2u32), 1 => Just(8u32),
+        2 => Just(9u32), 1 => Just(10u32)
+    ];
+    prop_oneof![
+        1 => Just(Wild::Empty),
+        2 => (1usize..4, 0usize..8).prop_map(|(back, k)| Wild::Marker { back, k }),
+        1 => (1u64..40).prop_map(|max| Wild::L9 { max }),
+        6 => (
+            prop::option::of((1usize..4, 0usize..8)),
+            prop::collection::vec((level, 1u64..40, 0u64..10), 1..7),
+        )
+            .prop_map(|(after, objs)| Wild::Objs { after, objs }),
+    ]
+}
+
+fn build_wild(gens: &[Wild]) -> BTreeMap<u64, Vec<Obj>> {
+    let mut out = BTreeMap::new();
+    let mut ends: Vec<Vec<u64>> = Vec::new();
+    for (i, g) in gens.iter().enumerate() {
+        // Sparse epoch numbers: celld's epochs need not be dense.
+        let epoch = 3 * i as u64 + 1;
+        let o = |level, min, max| Obj {
+            epoch,
+            level,
+            min,
+            max,
+        };
+        let after = |back: usize, k: usize| {
+            let e = ends.len().checked_sub(back).map(|i| &ends[i])?;
+            (!e.is_empty()).then(|| e[k % e.len()] + 1)
+        };
+        let objs: Vec<Obj> = match g {
+            Wild::Empty => vec![],
+            Wild::Marker { back, k } => {
+                let m = after(*back, *k).unwrap_or(2);
+                vec![o(0, m, m)]
+            }
+            Wild::L9 { max } => vec![o(9, 1, *max)],
+            Wild::Objs { after: at, objs } => {
+                let base = at.and_then(|(b, k)| after(b, k));
+                objs.iter()
+                    .enumerate()
+                    .map(|(j, &(level, min, len))| {
+                        // An L9 is always `1-max` (celld's restore plan
+                        // takes the newest L9 unchecked).
+                        let min = match (j, base) {
+                            _ if level == 9 => 1,
+                            (0, Some(b)) => b,
+                            _ => min,
+                        };
+                        o(level, min, min + len)
+                    })
+                    .collect()
+            }
+        };
+        let mut e: Vec<u64> = objs
+            .iter()
+            .filter(|o| o.level <= 9)
+            .map(|o| o.max)
+            .collect();
+        e.sort();
+        e.dedup();
+        ends.push(e);
+        out.insert(epoch, objs);
+    }
+    out
+}
+
+fn arb_wild_history() -> impl Strategy<Value = BTreeMap<u64, Vec<Obj>>> {
+    prop::collection::vec(arb_wild(), 1..10).prop_map(|g| build_wild(&g))
+}
+
+/// `walk` without overflow at `u64::MAX`.
+fn walk_sat(steps: &[Obj], from: u64, limit: Option<u64>) -> Option<u64> {
+    let mut p = from;
+    for s in steps {
+        if !(s.min <= p.saturating_add(1) && p < s.max) || limit.is_some_and(|l| s.max > l) {
+            return None;
+        }
+        p = s.max;
+    }
+    Some(p)
+}
+
+/// `brute` without overflow at `u64::MAX`.
+fn brute_sat(objs: &[Obj], from: u64, limit: Option<u64>, grain: Grain) -> (u64, usize) {
+    fn go(
+        objs: &[Obj],
+        p: u64,
+        n: usize,
+        limit: Option<u64>,
+        grain: Grain,
+        best: &mut (u64, usize),
+    ) {
+        let better = p > best.0
+            || (p == best.0
+                && match grain {
+                    Grain::Finest => n > best.1,
+                    Grain::Fold => n < best.1,
+                });
+        if better {
+            *best = (p, n);
+        }
+        for s in objs {
+            if s.min <= p.saturating_add(1) && p < s.max && limit.is_none_or(|l| s.max <= l) {
+                go(objs, s.max, n + 1, limit, grain, best);
+            }
+        }
+    }
+    let mut best = (from, 0);
+    go(objs, from, 0, limit, grain, &mut best);
+    best
+}
+
+/// Small objects shifted to just under `u64::MAX` (some ending on it), in
+/// up to three epochs, with inverted and zero-min ones mixed in.
+fn arb_extreme_objs() -> impl Strategy<Value = (u64, Vec<Obj>)> {
+    (
+        prop_oneof![Just(0u64), Just(u64::MAX - 20)],
+        prop::collection::vec((1u64..4, 0u32..3, 0u64..21, 0u64..8, 0u8..10), 0..=8),
+    )
+        .prop_map(|(base, v)| {
+            let objs = v
+                .into_iter()
+                .map(|(epoch, level, min, len, kind)| {
+                    let min = base.saturating_add(min);
+                    let max = min.saturating_add(len);
+                    match kind {
+                        0 => Obj {
+                            epoch,
+                            level,
+                            min: max,
+                            max: min,
+                        }, // inverted
+                        1 => Obj {
+                            epoch,
+                            level,
+                            min: 0,
+                            max,
+                        },
+                        _ => Obj {
+                            epoch,
+                            level,
+                            min,
+                            max,
+                        },
+                    }
+                })
+                .collect();
+            (base, objs)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    #[test]
+    fn prop_wild_epoch_chain_matches_celld(by_epoch in arb_wild_history()) {
+        let ours = epoch_chain(&by_epoch);
+        match block_on(celld_chain(&by_epoch)) {
+            Err(Error::TxNotAvailable) => prop_assert_eq!(ours, None),
+            Err(e) => panic!("celld: {e:?}"),
+            Ok(theirs) => {
+                let ours = ours.expect("celld found a chain");
+                let spans: Vec<(u64, TXID)> =
+                    ours.iter().map(|c| (c.epoch, TXID(c.lo))).collect();
+                prop_assert_eq!(spans, theirs.spans());
+                let mut objs: Vec<Obj> =
+                    ours.iter().flat_map(|c| c.objs.iter().copied()).collect();
+                objs.sort();
+                objs.dedup();
+                prop_assert_eq!(objs, block_on(chain_objs(&theirs)));
+            }
+        }
+    }
+
+    #[test]
+    fn prop_wild_chain_reach_equals_celld_restore_plan(by_epoch in arb_wild_history()) {
+        let Ok(theirs) = block_on(celld_chain(&by_epoch)) else {
+            return Ok(());
+        };
+        let Ok(plan) = block_on(calc_restore_plan(&theirs, TXID(0))) else {
+            return Ok(());
+        };
+        let celld_reach = plan.iter().map(|f| f.max_txid.0).max().unwrap_or(0);
+        let objs: Vec<Obj> = epoch_chain(&by_epoch)
+            .expect("celld found a chain")
+            .into_iter()
+            .flat_map(|c| c.objs)
+            .collect();
+        for grain in [Grain::Finest, Grain::Fold] {
+            let Path { steps, reach } = best_path(&objs, 0, None, grain);
+            prop_assert_eq!(reach, celld_reach);
+            prop_assert_eq!(walk(&steps, 0, None), Some(reach));
+        }
+    }
+
+    #[test]
+    fn prop_best_path_extremes_valid_maximal_order_free(
+        (base, objs) in arb_extreme_objs(),
+        from_off in 0u64..24,
+        limit_off in prop::option::of(0u64..24),
+        grain in arb_grain(),
+        perm in Just(()).prop_perturb(|_, mut rng| rng.next_u64()),
+    ) {
+        let from = base.saturating_add(from_off);
+        let limit = limit_off.map(|l| base.saturating_add(l));
+        let got = best_path(&objs, from, limit, grain);
+        prop_assert_eq!(walk_sat(&got.steps, from, limit), Some(got.reach));
+        prop_assert_eq!((got.reach, got.steps.len()), brute_sat(&objs, from, limit, grain));
+        // Any permutation (a seeded Fisher-Yates), duplicates included.
+        let mut shuffled = objs.clone();
+        shuffled.extend(objs.iter().take(2).copied());
+        let mut s = perm;
+        for i in (1..shuffled.len()).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            shuffled.swap(i, (s >> 33) as usize % (i + 1));
+        }
+        prop_assert_eq!(best_path(&shuffled, from, limit, grain), got);
+    }
+}
+
+/// The wild generator must reach the shapes it exists for.
+#[test]
+fn wild_generator_covers_markers_l9_tops_and_long_chains() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let (mut marker_links, mut l9_tops, mut long, mut skips, mut restores) = (0, 0, 0, 0, 0);
+    for _ in 0..512 {
+        let by_epoch = arb_wild_history().new_tree(&mut runner).unwrap().current();
+        let restored = block_on(async {
+            let c = celld_chain(&by_epoch).await.ok()?;
+            calc_restore_plan(&c, TXID(0)).await.ok()
+        });
+        restores += usize::from(restored.is_some_and(|p| p.len() >= 2));
+        let Some(chain) = epoch_chain(&by_epoch) else {
+            continue;
+        };
+        marker_links += usize::from(
+            chain.len() >= 2
+                && chain[1..]
+                    .iter()
+                    .any(|c| c.objs.len() == 1 && c.objs[0].min == c.objs[0].max),
+        );
+        l9_tops += usize::from(chain.len() == 1 && chain[0].objs.iter().all(|o| o.level == 9));
+        long += usize::from(chain.len() >= 3);
+        let first = chain[0].epoch;
+        let visited = by_epoch
+            .range(first..)
+            .filter(|(_, objs)| objs.iter().any(|o| o.level <= 9))
+            .count();
+        skips += usize::from(visited > chain.len());
+    }
+    assert!(
+        marker_links >= 20 && l9_tops >= 10 && long >= 15 && skips >= 20 && restores >= 20,
+        "marker_links {marker_links} l9_tops {l9_tops} long {long} skips {skips} restores {restores}"
+    );
+}

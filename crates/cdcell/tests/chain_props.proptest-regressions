@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7a23287e936cbc91314ed57e80206a21fc813e3c639ca4bf45da7ad2d9cc0249 # shrinks to by_epoch = {1: [Obj { epoch: 1, level: 9, min: 1, max: 13 }], 4: [], 7: [Obj { epoch: 7, level: 9, min: 14, max: 14 }, Obj { epoch: 7, level: 0, min: 1, max: 1 }]}
