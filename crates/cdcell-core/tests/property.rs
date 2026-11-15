@@ -351,9 +351,6 @@ fn run(
             .unwrap_or_else(|e| panic!("seed {seed} step {step}: {e}"));
         for s in &changes.schema {
             match s {
-                SchemaChange::DropTable { table, .. } => {
-                    model.remove(table);
-                }
                 SchemaChange::AlterTable {
                     table,
                     renamed: Some((old, new)),
@@ -368,6 +365,14 @@ fn run(
                 _ => {}
             }
         }
+        let dropped: Vec<String> = changes
+            .schema
+            .iter()
+            .filter_map(|s| match s {
+                SchemaChange::DropTable { table, .. } => Some(table.clone()),
+                _ => None,
+            })
+            .collect();
         for c in changes.rows {
             let t = model.entry(c.table.clone()).or_default();
             let k = c.key_json();
@@ -409,6 +414,11 @@ fn run(
                     }
                 }
             }
+        }
+        // A dropped table's rows are all deleted (the delete events above).
+        for table in dropped {
+            let left = model.remove(&table).map(|t| t.len()).unwrap_or(0);
+            assert_eq!(left, 0, "seed {seed} step {step}: rows of dropped {table} not deleted");
         }
         check(&model, &conn, &dec, step);
         prev = cur;

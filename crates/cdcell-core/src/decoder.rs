@@ -118,6 +118,9 @@ struct TableState {
 pub struct Decoder {
     pages: Pages,
     tables: BTreeMap<String, TableState>,
+    /// Tables dropped by the last applied unit: their schema stays visible
+    /// (`table_info`) so the deletes of their rows can be emitted.
+    dropped: BTreeMap<String, TableInfo>,
     cookie: Option<u32>,
     pub stats: Stats,
 }
@@ -166,7 +169,10 @@ impl Decoder {
     }
 
     pub fn table_info(&self, table: &str) -> Option<&TableInfo> {
-        self.tables.get(table).map(|t| &t.info)
+        self.tables
+            .get(table)
+            .map(|t| &t.info)
+            .or_else(|| self.dropped.get(table))
     }
 
     pub fn tables(&self) -> impl Iterator<Item = &TableInfo> {
@@ -228,6 +234,7 @@ impl Decoder {
         }
 
         let mut out = Changes::default();
+        let mut dropped = BTreeMap::new();
         let new_cookie = schema::schema_cookie(&self.pages, Some(&overlay));
         let new_infos: BTreeMap<String, TableInfo> =
             if new_cookie != self.cookie || (self.tables.is_empty() && overlay.contains_key(&1)) {
@@ -257,11 +264,22 @@ impl Decoder {
         for name in names {
             let old = self.tables.get(&name);
             let Some(info) = new_infos.get(&name) else {
-                let o = old.expect("name came from one side");
+                let o_info = old.expect("name came from one side").info.clone();
                 out.schema.push(SchemaChange::DropTable {
                     table: name.clone(),
-                    sql: o.info.sql.clone(),
+                    sql: o_info.sql.clone(),
                 });
+                // DROP TABLE (or a rename's old name): every row is gone.
+                for (_, (key, row)) in self.rows(&name)? {
+                    out.rows.push(RowChange {
+                        table: name.clone(),
+                        op: Op::Delete,
+                        key,
+                        before: Some(row),
+                        after: None,
+                    });
+                }
+                dropped.insert(name.clone(), o_info);
                 continue;
             };
             match old {
@@ -394,6 +412,7 @@ impl Decoder {
         self.pages.pages.retain(|&p, _| p <= commit);
         self.pages.commit = commit;
         self.tables = new_tables;
+        self.dropped = dropped;
         self.cookie = new_cookie;
         out.rows.sort_by(|a, b| {
             (a.table.as_str(), a.key_json()).cmp(&(b.table.as_str(), b.key_json()))

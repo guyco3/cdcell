@@ -163,9 +163,13 @@ pub fn progress_schema() -> Result<Schema> {
 }
 
 /// Identifier rule (design §2): lowercase, non-[a-z0-9_] → `_`.
+/// Identifier rule (design §2): lowercase; a name with characters outside
+/// `[a-z0-9_]` has them replaced by `_` plus a short hash of the original
+/// name, so distinct SQLite names (`a-b`, `a b`, `a_b`) never share a table.
 pub fn ident(name: &str) -> String {
-    let s: String = name
-        .to_ascii_lowercase()
+    use sha2::{Digest, Sha256};
+    let lower = name.to_ascii_lowercase();
+    let clean: String = lower
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' {
@@ -175,11 +179,58 @@ pub fn ident(name: &str) -> String {
             }
         })
         .collect();
+    let s = if clean == lower {
+        clean
+    } else {
+        let h = Sha256::digest(name.as_bytes());
+        format!("{clean}_{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3])
+    };
     if s.starts_with("_cdcell_") {
         format!("u_{s}")
     } else {
         s
     }
+}
+
+/// Additive evolution for a batch (design §5): the columns to add, and per
+/// row, a value whose type conflicts with its column's type (an existing
+/// column, or one added earlier in the same batch) moves to
+/// `<col>__<type>`.
+pub(crate) fn plan_columns(
+    existing: &dyn Fn(&str) -> Option<Type>,
+    rows: &mut [OutRow],
+) -> BTreeMap<String, PrimitiveType> {
+    let mut add: BTreeMap<String, PrimitiveType> = BTreeMap::new();
+    let current = |add: &BTreeMap<String, PrimitiveType>, name: &str| {
+        existing(name).or_else(|| add.get(name).map(|p| Type::Primitive(p.clone())))
+    };
+    for row in rows.iter_mut() {
+        let names: Vec<String> = row
+            .keys()
+            .filter(|k| !k.starts_with("__"))
+            .cloned()
+            .collect();
+        for name in names {
+            let Some(want) = value_type(&row[&name]) else {
+                continue;
+            };
+            match current(&add, &name) {
+                None => {
+                    add.insert(name, want);
+                }
+                Some(Type::Primitive(p)) if p == want => {}
+                Some(_) => {
+                    let alt = format!("{name}__{}", type_suffix(&want));
+                    let v = row.remove(&name).unwrap();
+                    row.insert(alt.clone(), v);
+                    if current(&add, &alt).is_none() {
+                        add.insert(alt, want);
+                    }
+                }
+            }
+        }
+    }
+    add
 }
 
 /// Table properties cdcell maintains on its tables (design §9).
@@ -503,46 +554,27 @@ impl Sink {
     pub async fn evolve(&self, ident: &TableIdent, rows: &mut [OutRow]) -> Result<()> {
         let table = self.catalog.load_table(ident).await?;
         let schema = table.metadata().current_schema().clone();
-        let mut registry: BTreeMap<String, i64> = table
-            .metadata()
-            .properties()
-            .get("cdcell.schemas")
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+        // A registry that does not parse is an error: resetting it would
+        // reassign schema versions.
+        let mut registry: BTreeMap<String, i64> =
+            match table.metadata().properties().get("cdcell.schemas") {
+                Some(s) => serde_json::from_str(s).with_context(|| {
+                    format!("table {ident}: property cdcell.schemas does not parse")
+                })?,
+                None => BTreeMap::new(),
+            };
         let before = registry.clone();
-        let mut add: BTreeMap<String, PrimitiveType> = BTreeMap::new();
         for row in rows.iter_mut() {
             if let Some(OutValue::Str(fp)) = row.remove(crate::emit::FINGERPRINT) {
                 let next = registry.values().max().copied().unwrap_or(0) + 1;
                 let v = *registry.entry(fp).or_insert(next);
                 row.insert("__schema_version".into(), OutValue::Long(v));
             }
-            let names: Vec<String> = row
-                .keys()
-                .filter(|k| !k.starts_with("__"))
-                .cloned()
-                .collect();
-            for name in names {
-                let Some(want) = value_type(&row[&name]) else {
-                    continue;
-                };
-                let existing = schema.field_by_name(&name).map(|f| (*f.field_type).clone());
-                match existing {
-                    None => {
-                        add.entry(name).or_insert(want);
-                    }
-                    Some(Type::Primitive(p)) if p == want => {}
-                    Some(_) => {
-                        let alt = format!("{name}__{}", type_suffix(&want));
-                        let v = row.remove(&name).unwrap();
-                        row.insert(alt.clone(), v);
-                        if schema.field_by_name(&alt).is_none() {
-                            add.entry(alt).or_insert(want);
-                        }
-                    }
-                }
-            }
         }
+        let add = plan_columns(
+            &|name: &str| schema.field_by_name(name).map(|f| (*f.field_type).clone()),
+            rows,
+        );
         if add.is_empty() && registry == before {
             return Ok(());
         }
@@ -843,4 +875,53 @@ fn arrow_buffer_nulls(valid: impl Iterator<Item = bool>) -> Option<arrow_buffer:
 
 fn arrow_buffer_offsets(offsets: Vec<i32>) -> arrow_buffer::OffsetBuffer<i32> {
     arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(offsets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, OutValue)]) -> OutRow {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_columns_same_batch_type_conflict() {
+        // `v` is new; one cell writes an integer, another text, in one batch
+        let mut rows = vec![
+            row(&[("v", OutValue::Long(1))]),
+            row(&[("v", OutValue::Str("x".into()))]),
+        ];
+        let add = plan_columns(&|_| None, &mut rows);
+        assert_eq!(add.get("v"), Some(&PrimitiveType::Long));
+        assert_eq!(add.get("v__string"), Some(&PrimitiveType::String));
+        assert_eq!(rows[1].get("v__string"), Some(&OutValue::Str("x".into())));
+        assert!(!rows[1].contains_key("v"));
+    }
+
+    #[test]
+    fn plan_columns_existing_schema() {
+        let existing = |n: &str| (n == "v").then(|| Type::Primitive(PrimitiveType::Long));
+        let mut rows = vec![row(&[
+            ("v", OutValue::Long(1)),
+            ("w", OutValue::Double(2.0)),
+        ])];
+        let add = plan_columns(&existing, &mut rows);
+        assert_eq!(add.len(), 1);
+        assert_eq!(add.get("w"), Some(&PrimitiveType::Double));
+    }
+
+    #[test]
+    fn ident_never_collides_and_keeps_plain_names() {
+        assert_eq!(ident("Orders"), "orders");
+        assert_eq!(ident("order_items"), "order_items");
+        let (a, b, c) = (ident("a-b"), ident("a b"), ident("a_b"));
+        assert_eq!(c, "a_b");
+        assert!(a.starts_with("a_b_") && b.starts_with("a_b_"));
+        assert!(a != b && a != c && b != c);
+        assert_eq!(ident("_cdcell_kv"), "u__cdcell_kv");
+    }
 }
