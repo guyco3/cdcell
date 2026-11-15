@@ -476,6 +476,25 @@ is not tied to one vendor:
 | Queue | a small adapter | SQS, NATS JetStream; others (Kafka, Pub/Sub) are an adapter each |
 | Consumers | Iceberg tables | Spark, Trino, ClickHouse, DuckDB, Snowflake, BigQuery (BigLake), Athena, Flink |
 
+**Queues by storage provider** (S3-style notifications must reach the queue
+natively; check the provider's current docs):
+
+| celld bucket on | Native notification targets | Queue cdcell reads |
+|---|---|---|
+| AWS S3 | SQS, SNS, Lambda, EventBridge | SQS (Kafka/MSK would need a forwarder) |
+| MinIO | Kafka, NATS JetStream, AMQP, Redis, MQTT, webhooks, … | Kafka or JetStream |
+| Ceph RGW | Kafka, AMQP, HTTP | Kafka |
+| Cloudflare R2 | Cloudflare Queues | Cloudflare Queues (HTTP pull) |
+| Google Cloud Storage | Pub/Sub | Pub/Sub |
+| Azure Blob | Event Grid → Storage Queue or Event Hubs | Event Hubs (Kafka endpoint) |
+
+Adapters, in order: SQS; the Kafka protocol (Apache Kafka, Redpanda,
+Confluent, MSK, Aiven, WarpStream, Event Hubs): `plan` reads with a consumer
+group and commits offsets after writing the key files; NATS JetStream
+(built); Cloudflare Queues; Pub/Sub. One interface: fetch a batch of keys,
+acknowledge after the key files are durable. Retention (SQS up to 14 days,
+Kafka `retention.ms`, JetStream `max_age`) must exceed the longest outage.
+
 Engines such as Spark belong on the consumer side, if the customer has one
 (type-1/type-2 MERGEs; consumer guide). None is required.
 
