@@ -105,7 +105,7 @@ shards and pending sets.
 
 The queue is the only discovery mechanism. celld's bucket sends a
 notification for every object created under `cells/` and under `log/` to a
-queue (SQS or JetStream), at least once (§7). Rules filter to `.ltx` and
+queue (SQS or JetStream), at least once (§8). Rules filter to `.ltx` and
 `.ltxb` keys (G5); anything else that slips through (`own.json`,
 `retired.json`) is dropped.
 
@@ -128,7 +128,7 @@ queue (SQS or JetStream), at least once (§7). Rules filter to `.ltx` and
   (C7), so per-cell objects alone give it no freshness bound.
 - Cells that existed before cdcell was deployed and never write again are
   not exported: no notification ever names them. A one-time, operator-run
-  `cdcell backfill` is planned (§10).
+  `cdcell backfill` is planned (§11).
 
 **When cdcell LISTs.** Only for one cell, and only when **its queued keys
 do not by themselves give an unbroken, provable chain** from what cdcell
@@ -150,7 +150,7 @@ object starting at TXID 1. So:
 |---|---|
 | Gap inside epoch E | `e<E>/0001/` and `e<E>/0009/` in full (one object per fold or handoff, few); `e<E>/0000/` with `StartAfter` at the cell's durable boundary (§2.3) |
 | Epoch change | a delimiter LIST of `cells/<cell>/ltx/` for the epochs; then each epoch to walk as above, from TXID 0 |
-| Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §8) |
+| Bootstrap, rebuild, resync | from TXID 0, walking the epoch chain down from the newest epoch (celld's `EpochChain` semantics, §9) |
 
 There is no other LIST: no sweep, no daily job, no LIST of bundles or live
 sessions, and no guessed-key GETs (an L1's max is not predictable: the fold
@@ -171,7 +171,7 @@ TXID does not keep a file of its own once folded.
 | Missing in the middle (cursor 299; queue has `556-811`, not `300-555`) | The ranges do not cover every TXID from the cursor on: the planner never skips. The LIST rule applies and the run continues with what it finds. |
 | Missing at the end (queue has `300-555`, not `556-811`) | The cell advances to 555, the last point it can prove in sequence. A late notification is processed next run. |
 | Late, after a LIST already covered it | At or below the cursor: ignored. |
-| Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§7). |
+| Lost, and it was the cell's only notification | The cell catches up on its next write: its next key leaves a gap, and the gap LIST finds the missing object. S3 delivers at least once, so this needs a broken setup (§8). |
 | Owner restarted into a snapshot epoch before the run read the old tail | The old epoch's unproven tail and the new epoch's first writes become one net change at the opener (§4). |
 
 ### 2.2 Planning one cell
@@ -334,12 +334,26 @@ them.
 
 ### 5.1 Partitioning and sort order (change-log tables)
 
-- **Partition spec: `day(__ts)`.** Time-bounded queries and type-2 "as of"
-  queries prune by day. Late data (an outage, a bootstrap) appends to older
-  days. Hidden partitioning, so queries never mention it. `__ts` is the
-  owner's wall clock (B9): clock skew can create stray day partitions, and
-  correctness must never depend on `__ts`; order and as-of logic use
-  `(__epoch, __txid)`.
+- **Partition spec: configurable, default `day(__ts)`.** Iceberg hidden
+  partitioning with a transform, the standard for Iceberg (not Hive-style
+  `year=/month=/day=` columns): a plain `WHERE __ts >= …` prunes, and queries
+  never mention partitions. Pick the granularity by volume, aiming at
+  partitions of ~1 GB or more and files of 128 MiB-1 GiB:
+
+  | Table volume | Spec |
+  |---|---|
+  | small (< ~1 GB a month) | `month(__ts)` |
+  | medium (default) | `day(__ts)` |
+  | very large (many GB a day) | `hour(__ts)`, often with `bucket(N, __cell_id)` |
+
+  Settings: `CDCELL_PARTITION` (all tables, e.g. `day(__ts)`) and
+  `CDCELL_PARTITION_<table>` (one table, e.g. `month(__ts),bucket(8,__cell_id)`).
+  The time column may be `__ts` or `__ingested_at`. A changed setting is
+  applied by Iceberg partition evolution: new files use the new spec, old
+  files stay, no rewrite. Late data (an outage, a bootstrap) appends to
+  older partitions. `__ts` is the owner's wall clock (B9): clock skew can
+  create stray partitions, and correctness never depends on `__ts`; order
+  and as-of logic use `(__epoch, __txid)`.
 - **Sort order: `__cell_id, __key, __epoch, __txid`** (declared as the
   table's sort order, applied when writing each file). Per-object queries
   (`__cell_id = …`) and type-1 MERGEs prune by column statistics without
@@ -347,9 +361,8 @@ them.
   file is for pruning; consumers still order by `(__epoch, __txid)`.
 - **No `bucket(__cell_id)` by default.** With runs every few hours it would
   multiply the files per run by the bucket count for little gain on sorted
-  files. Enable per table (`CDCELL_BUCKETS=<table>=<n>`, applied by
-  partition evolution, no rewrite) once a table writes more than ~10 GB a
-  day or a Spark MERGE wants bucketed joins.
+  files. Add it per table through `CDCELL_PARTITION_<table>` once a table
+  writes more than ~10 GB a day or an engine's MERGE wants bucketed joins.
 - **Incremental consumers** read by batch: `_cdcell_progress.batch` or the
   snapshot summary `cdcell.batch`. One committer commits batches in seq
   order, so `batch > <last seen>` is a safe cursor. Iceberg snapshot-based
@@ -398,7 +411,28 @@ Compared with revision 5:
 `docs/cost.md` will measure this on the e2e stack (MinIO request metrics),
 as a function of cells, write rate, restart rate and run interval.
 
-## 7. Operating requirements
+## 7. Deployment
+
+cdcell is one container image (a static binary inside) that runs a batch and
+exits (`cdcell run --once`), or repeats every `CDCELL_RUN_INTERVAL`. It needs
+no Spark or other cluster: the work is decoding each object's changes in
+order with per-object state, I/O-bound and sequential per object, and it
+writes Iceberg itself. Parallelism comes from partitions inside the process
+(and later from several containers). It only uses standard interfaces, so it
+is not tied to one vendor:
+
+| Piece | Interface | Examples |
+|---|---|---|
+| Scheduler | runs a container on a schedule | Kubernetes CronJob, ECS scheduled task, Cloud Run jobs, Nomad periodic job, cron on a VM, a task in Airflow / Dagster / Argo |
+| celld bucket, lake bucket, state prefix | S3 API | AWS S3, MinIO, Cloudflare R2, GCS (S3 interoperability) |
+| Catalog | Iceberg REST catalog spec | Lakekeeper, Apache Polaris, Nessie, AWS Glue (REST endpoint), S3 Tables, Unity Catalog, Snowflake Open Catalog |
+| Queue | a small adapter | SQS, NATS JetStream; others (Kafka, Pub/Sub) are an adapter each |
+| Consumers | Iceberg tables | Spark, Trino, ClickHouse, DuckDB, Snowflake, BigQuery (BigLake), Athena, Flink |
+
+Engines such as Spark belong on the consumer side, if the customer has one
+(type-1/type-2 MERGEs; consumer guide). None is required.
+
+## 8. Operating requirements
 
 1. celld's epoch GC off (default), or its grace above the longest gap
    between successful runs. Otherwise the fallback resync applies:
@@ -417,7 +451,7 @@ as a function of cells, write rate, restart rate and run interval.
    JetStream `max_age`). Without it, a quiet cell's final objects may never
    be exported: no later write reveals the gap.
 
-## 8. What carries over from the streaming code
+## 9. What carries over from the streaming code
 
 | Kept | Changed or replaced |
 |---|---|
@@ -429,7 +463,7 @@ as a function of cells, write rate, restart rate and run interval.
 The test kit (fake celld with real SQLite and LTX, `MemSink`, paused time)
 carries over: tests queue notifications, then call `run_once`.
 
-## 9. To verify or build before shipping
+## 10. To verify or build before shipping
 
 1. Freshness of quiet resident cells with the live tail on and off in fleet
    mode (e2e).
@@ -444,7 +478,7 @@ carries over: tests queue notifications, then call `run_once`.
 6. Lakekeeper fencing (§3.3) is verified on 0.15.0; keep it as an e2e
    test.
 
-## 10. Planned
+## 11. Planned
 
 - `cdcell backfill`: a one-time command the operator runs at install. It
   LISTs `cells/` once and exports cells that existed before cdcell and
