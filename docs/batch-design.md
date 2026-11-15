@@ -287,6 +287,15 @@ cdcell stage --task <i>     N in parallel: decode the task's partitions, write c
 cdcell commit               read every p<k>.json; one atomic commit with the fence
 ```
 
+- **Only `plan` reads the queue.** It drains it with concurrent pollers,
+  writes the keys per partition (`_cdcell/runs/<seq>/p<k>/keys.json`), GETs
+  and splits bundles into per-partition row files (a bundle mixes cells of
+  many partitions, so this happens once, centrally), and acknowledges the
+  messages only after those files are written. Stage tasks read their
+  partitions' files from the state prefix: no competing consumers, no
+  visibility timeout or ack deadline spanning a run, no ordering needed.
+  Files of a failed run stay as the pending set; the next `plan` merges
+  them with new messages.
 - One machine: `cdcell run` does all three, partitions as threads (default).
 - Several machines: any fan-out runner (a Kubernetes Indexed Job, Cloud Run
   job tasks, N ECS/Fargate tasks, an Airflow/Argo/Dagster fan-out, or a Spark
